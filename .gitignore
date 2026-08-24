@@ -1,0 +1,6 @@
+/convertbox
+/tmp/
+*.exe
+*.test
+.env
+.DS_Store

@@ -1,0 +1,24 @@
+services:
+  convertbox:
+    build: .
+    ports: ["8080:8080"]
+    read_only: true
+    tmpfs:
+      - /tmp/convertbox:size=128m,mode=0700,uid=10001,gid=10001
+    cpus: 1.0
+    mem_limit: 256m
+    pids_limit: 64
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    environment:
+      CONVERTBOX_MAX_MB: "25"
+      CONVERTBOX_WORKERS: "2"
+      CONVERTBOX_QUEUE_SIZE: "20"
+      CONVERTBOX_JOB_TIMEOUT: "45s"
+      CONVERTBOX_JOB_TTL: "20m"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
