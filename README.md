@@ -43,16 +43,22 @@ ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. F
 | `CONVERTBOX_JOB_TTL` | `20m` | Retention after completion |
 | `CONVERTBOX_CLEANUP_INTERVAL` | `1m` | Cleanup sweep interval |
 | `CONVERTBOX_UPLOAD_TIMEOUT` | `30s` | Server read deadline |
+| `CONVERTBOX_RATE_RPS` | `1` | Per-IP job submission rate (tokens/sec) |
+| `CONVERTBOX_RATE_BURST` | `5` | Per-IP token bucket burst size |
+| `CONVERTBOX_MAX_JOBS_PER_IP` | `4` | Max concurrent (queued/processing) jobs per IP |
 
 Durations use Go syntax such as `30s` and `10m`.
 
 ## API
 
 - `GET /api/v1/formats` — capabilities and limits
-- `POST /api/v1/jobs` — multipart fields: `file`, `outputFormat`, optional `outputName`
+- `POST /api/v1/jobs` — multipart fields: `file`, `outputFormat`, optional `outputName`; rate-limited and quota-limited per IP
 - `GET /api/v1/jobs/{uuid}` — job status
 - `GET /api/v1/jobs/{uuid}/download` — completed output
 - `GET /healthz` — liveness
+- `GET /metrics` — Prometheus metrics (HTTP and job counters/histograms); not authenticated, so keep it off public ingress or scrape it internally
+
+Every response carries an `X-Request-ID` header (echoed back if the caller supplies a well-formed one) for correlating logs.
 
 Example:
 
@@ -69,7 +75,9 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 - Original names are metadata only. Server-generated paths are used for input and output; rename input is reduced to a safe basename.
 - External tools use `exec.CommandContext` with separate fixed arguments, a fixed working directory, and a minimal environment—never shell concatenation.
 - Queue length, workers, body size, request time, and job time are bounded. Container runtime limits provide hard CPU/RAM/PID/storage boundaries.
+- Per-IP token-bucket rate limiting and a concurrent-job quota bound submission abuse from a single client; the client IP is read from the raw TCP connection, not from forwardable headers like `X-Forwarded-For`.
 - Cleanup verifies that targets are descendants of the converter root and refuses symlink job directories. Old orphan directories are removed after restart.
+- Job state is persisted to a `job.json` sidecar per job so status/downloads survive a restart. Jobs still in flight at shutdown are recovered as failed rather than silently resumed.
 - Logs contain job ID, formats, size, worker, and errors—not user file contents.
 - Downloads use `nosniff`, attachment disposition, and an opaque content type.
 

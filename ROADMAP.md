@@ -2,11 +2,11 @@
 
 ## 0.2 — operational hardening
 
-- Persist minimal job state for restart-safe status reporting.
-- Per-IP token-bucket rate limiting and upload quotas.
-- Prometheus metrics, request IDs, and OpenTelemetry hooks.
-- Separate API and conversion worker containers with a Redis-backed queue.
-- Optional antivirus/content-disarm stage.
+- [x] Persist minimal job state for restart-safe status reporting.
+- [x] Per-IP token-bucket rate limiting and upload quotas.
+- [x] Prometheus metrics, request IDs, and OpenTelemetry hooks.
+- [ ] Separate API and conversion worker containers with a Redis-backed queue.
+- [ ] Optional antivirus/content-disarm stage.
 
 ## 0.3 — more engines
 

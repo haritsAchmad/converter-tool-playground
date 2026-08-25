@@ -20,6 +20,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 //go:embed web/*
@@ -31,6 +35,9 @@ type App struct {
 	store     *store
 	converter *converter
 	queue     chan *Job
+	limiter   *rateLimiter
+	metrics   *metrics
+	registry  *prometheus.Registry
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -42,7 +49,16 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	a := &App{cfg: cfg, log: logger, store: s, converter: newConverter(), queue: make(chan *Job, cfg.QueueSize), ctx: ctx, cancel: cancel}
+	queue := make(chan *Job, cfg.QueueSize)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	m := newMetrics(registry, func() float64 { return float64(len(queue)) })
+	a := &App{
+		cfg: cfg, log: logger, store: s, converter: newConverter(),
+		queue: queue, limiter: newRateLimiter(cfg.RateRPS, cfg.RateBurst),
+		metrics: m, registry: registry, ctx: ctx, cancel: cancel,
+	}
+	s.recover(time.Now().UTC(), logger)
 	for i := 0; i < cfg.Workers; i++ {
 		a.wg.Add(1)
 		go a.worker(i)
@@ -57,12 +73,20 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("GET /api/v1/formats", a.getFormats)
-	mux.HandleFunc("POST /api/v1/jobs", a.createJob)
+	mux.Handle("POST /api/v1/jobs", a.rateLimitJobs(a.createJob))
 	mux.HandleFunc("GET /api/v1/jobs/{id}", a.getJob)
 	mux.HandleFunc("GET /api/v1/jobs/{id}/download", a.download)
+	mux.Handle("GET /metrics", promhttp.HandlerFor(a.registry, promhttp.HandlerOpts{}))
 	static, _ := fs.Sub(webFiles, "web")
 	mux.Handle("/", http.FileServer(http.FS(static)))
-	return a.securityHeaders(a.recoverer(mux))
+
+	// otelhttp is wired against the global (no-op by default) TracerProvider,
+	// so tracing lights up automatically if the process later configures a
+	// real exporter, at negligible cost while none is configured.
+	traced := otelhttp.NewHandler(mux, "convertbox", otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
+		return r.Method + " " + metricsPath(r.URL.Path)
+	}))
+	return a.securityHeaders(a.recoverer(withRequestID(a.accessLog(traced))))
 }
 
 func (a *App) getFormats(w http.ResponseWriter, r *http.Request) {
@@ -72,6 +96,11 @@ func (a *App) getFormats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	if a.store.countActiveByIP(ip) >= a.cfg.MaxJobsPerIP {
+		writeError(w, http.StatusTooManyRequests, "too many concurrent jobs for this client")
+		return
+	}
 	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxUploadBytes+(1<<20))
 	mr, err := r.MultipartReader()
 	if err != nil {
@@ -150,8 +179,11 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	j := &Job{ID: id, Status: Queued, InputFormat: in, OutputFormat: out, OriginalName: original, OutputName: base + ext, Size: size, CreatedAt: now, ExpiresAt: now.Add(a.cfg.JobTTL), InputPath: inputPath, OutputPath: outPath, mu: &sync.RWMutex{}}
+	j := &Job{ID: id, Status: Queued, InputFormat: in, OutputFormat: out, OriginalName: original, OutputName: base + ext, Size: size, CreatedAt: now, ExpiresAt: now.Add(a.cfg.JobTTL), InputPath: inputPath, OutputPath: outPath, ClientIP: ip, mu: &sync.RWMutex{}}
 	a.store.add(j)
+	if err := a.store.persist(j); err != nil {
+		a.log.Warn("failed to persist job state", "job_id", j.ID, "error", err)
+	}
 	select {
 	case a.queue <- j:
 		keep = true
@@ -249,6 +281,7 @@ func (a *App) worker(index int) {
 	}
 }
 func (a *App) process(index int, j *Job) {
+	start := time.Now()
 	j.update(func(x *Job) { x.Status = Processing })
 	ctx, cancel := context.WithTimeout(a.ctx, a.cfg.JobTimeout)
 	defer cancel()
@@ -264,6 +297,11 @@ func (a *App) process(index int, j *Job) {
 			x.Status = Completed
 		}
 	})
+	if perr := a.store.persist(j); perr != nil {
+		a.log.Warn("failed to persist job state", "job_id", j.ID, "error", perr)
+	}
+	a.metrics.jobsTotal.WithLabelValues(string(j.snapshot().Status), j.InputFormat, j.OutputFormat).Inc()
+	a.metrics.jobDuration.Observe(time.Since(start).Seconds())
 	if err != nil {
 		_ = os.Remove(j.OutputPath)
 		a.log.Warn("conversion failed", "job_id", j.ID, "input", j.InputFormat, "output", j.OutputFormat, "size", j.Size, "worker", index, "error", err)
@@ -283,6 +321,7 @@ func (a *App) janitor() {
 			for _, id := range a.store.cleanup(now) {
 				a.log.Info("expired job removed", "job_id", id)
 			}
+			a.limiter.sweep(30 * time.Minute)
 		}
 	}
 }

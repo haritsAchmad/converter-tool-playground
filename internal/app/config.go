@@ -13,6 +13,8 @@ type Config struct {
 	MaxUploadBytes                                     int64
 	Workers, QueueSize                                 int
 	JobTimeout, JobTTL, CleanupInterval, UploadTimeout time.Duration
+	RateRPS, RateBurst                                 float64
+	MaxJobsPerIP                                       int
 }
 
 func LoadConfig() (Config, error) {
@@ -25,9 +27,15 @@ func LoadConfig() (Config, error) {
 		JobTTL:          envDuration("CONVERTBOX_JOB_TTL", 20*time.Minute),
 		CleanupInterval: envDuration("CONVERTBOX_CLEANUP_INTERVAL", time.Minute),
 		UploadTimeout:   envDuration("CONVERTBOX_UPLOAD_TIMEOUT", 30*time.Second),
+		RateRPS:         envFloat("CONVERTBOX_RATE_RPS", 1),
+		RateBurst:       envFloat("CONVERTBOX_RATE_BURST", 5),
+		MaxJobsPerIP:    envInt("CONVERTBOX_MAX_JOBS_PER_IP", 4),
 	}
 	if c.Workers < 1 || c.QueueSize < 1 || c.MaxUploadBytes < 1 || c.JobTTL < time.Minute {
 		return c, fmt.Errorf("workers, queue, size must be positive and TTL at least 1m")
+	}
+	if c.RateRPS <= 0 || c.RateBurst < 1 || c.MaxJobsPerIP < 1 {
+		return c, fmt.Errorf("rate rps/burst and max jobs per IP must be positive")
 	}
 	return c, nil
 }
@@ -47,6 +55,13 @@ func envInt(key string, fallback int) int {
 }
 func envDuration(key string, fallback time.Duration) time.Duration {
 	v, err := time.ParseDuration(os.Getenv(key))
+	if err == nil && v > 0 {
+		return v
+	}
+	return fallback
+}
+func envFloat(key string, fallback float64) float64 {
+	v, err := strconv.ParseFloat(os.Getenv(key), 64)
 	if err == nil && v > 0 {
 		return v
 	}

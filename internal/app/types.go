@@ -28,6 +28,7 @@ type Job struct {
 	Error        string     `json:"error,omitempty"`
 	InputPath    string     `json:"-"`
 	OutputPath   string     `json:"-"`
+	ClientIP     string     `json:"-"`
 	mu           *sync.RWMutex
 }
 
