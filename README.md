@@ -46,6 +46,8 @@ ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. F
 | `CONVERTBOX_RATE_RPS` | `1` | Per-IP job submission rate (tokens/sec) |
 | `CONVERTBOX_RATE_BURST` | `5` | Per-IP token bucket burst size |
 | `CONVERTBOX_MAX_JOBS_PER_IP` | `4` | Max concurrent (queued/processing) jobs per IP |
+| `CONVERTBOX_CLAMSCAN` | disabled | Path or command name for an optional `clamscan` executable |
+| `CONVERTBOX_SCAN_TIMEOUT` | `15s` | Per-upload antivirus scan deadline |
 
 Durations use Go syntax such as `30s` and `10m`.
 
@@ -71,6 +73,7 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 
 - Extension, detected MIME, magic bytes, and syntax/header validation are combined; filenames alone are never trusted.
 - Executable/script extensions and common executable signatures are rejected.
+- When `CONVERTBOX_CLAMSCAN` is configured, uploads must pass ClamAV before entering the conversion queue. Detection rejects the upload; scanner errors and timeouts fail closed.
 - Uploads are streamed into mode `0600` UUID job directories (mode `0700`) under one normalized storage root.
 - Original names are metadata only. Server-generated paths are used for input and output; rename input is reduced to a safe basename.
 - External tools use `exec.CommandContext` with separate fixed arguments, a fixed working directory, and a minimal environment—never shell concatenation.

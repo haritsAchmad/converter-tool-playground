@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -97,6 +98,22 @@ func TestRejectsDisguisedActiveContent(t *testing.T) {
 				t.Fatalf("expected %q to be rejected", tt.filename)
 			}
 		})
+	}
+}
+
+type rejectingScanner struct{}
+
+func (rejectingScanner) Scan(context.Context, string) error { return errMalwareDetected }
+
+func TestMalwareScanRejectsBeforeQueue(t *testing.T) {
+	a := testApp(t)
+	a.scanner = rejectingScanner{}
+	w := submitCSVJob(t, a)
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected malware rejection, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(a.queue) != 0 {
+		t.Fatal("rejected upload reached conversion queue")
 	}
 }
 

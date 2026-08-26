@@ -7,7 +7,8 @@
 - [x] Prometheus metrics, request IDs, and OpenTelemetry hooks.
 - [x] Layered upload gate: extension chain, magic bytes, MIME, syntax, and active-script rejection.
 - [ ] Separate API and conversion worker containers with a Redis-backed queue.
-- [ ] Optional antivirus/content-disarm stage.
+- [x] Optional ClamAV stage before the conversion queue; fail closed when enabled.
+- [ ] Format-specific content-disarm stage for future complex document formats.
 
 ## 0.3 — more engines
 

@@ -38,6 +38,7 @@ type App struct {
 	limiter   *rateLimiter
 	metrics   *metrics
 	registry  *prometheus.Registry
+	scanner   malwareScanner
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
@@ -45,6 +46,10 @@ type App struct {
 
 func New(cfg Config, logger *slog.Logger) (*App, error) {
 	s, err := newStore(cfg.StorageRoot)
+	if err != nil {
+		return nil, err
+	}
+	scanner, err := newClamScanner(cfg.ClamScanPath)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +61,7 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	a := &App{
 		cfg: cfg, log: logger, store: s, converter: newConverter(),
 		queue: queue, limiter: newRateLimiter(cfg.RateRPS, cfg.RateBurst),
-		metrics: m, registry: registry, ctx: ctx, cancel: cancel,
+		metrics: m, registry: registry, scanner: scanner, ctx: ctx, cancel: cancel,
 	}
 	s.recover(time.Now().UTC(), logger)
 	for i := 0; i < cfg.Workers; i++ {
@@ -158,6 +163,20 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, 415, err.Error())
 		return
+	}
+	if a.scanner != nil {
+		scanCtx, cancel := context.WithTimeout(r.Context(), a.cfg.ScanTimeout)
+		err := a.scanner.Scan(scanCtx, inputPath)
+		cancel()
+		if errors.Is(err, errMalwareDetected) {
+			writeError(w, http.StatusUnprocessableEntity, "file failed malware scan")
+			return
+		}
+		if err != nil {
+			a.log.Warn("malware scan failed", "error", err)
+			writeError(w, http.StatusServiceUnavailable, "malware scanner unavailable")
+			return
+		}
 	}
 	out := strings.ToLower(strings.TrimSpace(fields["outputFormat"]))
 	if !a.converter.supports(in, out) {

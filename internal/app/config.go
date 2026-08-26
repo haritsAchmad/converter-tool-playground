@@ -9,10 +9,11 @@ import (
 )
 
 type Config struct {
-	Address, StorageRoot                               string
+	Address, StorageRoot, ClamScanPath                 string
 	MaxUploadBytes                                     int64
 	Workers, QueueSize                                 int
 	JobTimeout, JobTTL, CleanupInterval, UploadTimeout time.Duration
+	ScanTimeout                                        time.Duration
 	RateRPS, RateBurst                                 float64
 	MaxJobsPerIP                                       int
 }
@@ -27,6 +28,8 @@ func LoadConfig() (Config, error) {
 		JobTTL:          envDuration("CONVERTBOX_JOB_TTL", 20*time.Minute),
 		CleanupInterval: envDuration("CONVERTBOX_CLEANUP_INTERVAL", time.Minute),
 		UploadTimeout:   envDuration("CONVERTBOX_UPLOAD_TIMEOUT", 30*time.Second),
+		ClamScanPath:    os.Getenv("CONVERTBOX_CLAMSCAN"),
+		ScanTimeout:     envDuration("CONVERTBOX_SCAN_TIMEOUT", 15*time.Second),
 		RateRPS:         envFloat("CONVERTBOX_RATE_RPS", 1),
 		RateBurst:       envFloat("CONVERTBOX_RATE_BURST", 5),
 		MaxJobsPerIP:    envInt("CONVERTBOX_MAX_JOBS_PER_IP", 4),
