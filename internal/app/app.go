@@ -34,7 +34,7 @@ type App struct {
 	log       *slog.Logger
 	store     *store
 	converter *converter
-	queue     chan *Job
+	queue     jobQueue
 	limiter   *rateLimiter
 	metrics   *metrics
 	registry  *prometheus.Registry
@@ -45,6 +45,9 @@ type App struct {
 }
 
 func New(cfg Config, logger *slog.Logger) (*App, error) {
+	if cfg.Mode == "" {
+		cfg.Mode = "standalone"
+	}
 	s, err := newStore(cfg.StorageRoot)
 	if err != nil {
 		return nil, err
@@ -53,26 +56,37 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
+	queue, err := newJobQueue(cfg)
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	queue := make(chan *Job, cfg.QueueSize)
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	m := newMetrics(registry, func() float64 { return float64(len(queue)) })
+	m := newMetrics(registry, queue.Depth)
 	a := &App{
 		cfg: cfg, log: logger, store: s, converter: newConverter(),
 		queue: queue, limiter: newRateLimiter(cfg.RateRPS, cfg.RateBurst),
 		metrics: m, registry: registry, scanner: scanner, ctx: ctx, cancel: cancel,
 	}
-	s.recover(time.Now().UTC(), logger)
-	for i := 0; i < cfg.Workers; i++ {
-		a.wg.Add(1)
-		go a.worker(i)
+	s.recover(time.Now().UTC(), logger, cfg.Mode == "standalone", cfg.Mode == "standalone")
+	if cfg.Mode != "api" {
+		for i := 0; i < cfg.Workers; i++ {
+			a.wg.Add(1)
+			go a.worker(i)
+		}
 	}
-	a.wg.Add(1)
-	go a.janitor()
+	if cfg.Mode != "worker" {
+		a.wg.Add(1)
+		go a.janitor()
+	}
 	return a, nil
 }
-func (a *App) Close() { a.cancel(); a.wg.Wait() }
+func (a *App) Close() {
+	a.cancel()
+	_ = a.queue.Close()
+	a.wg.Wait()
+}
 
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -202,14 +216,21 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 	a.store.add(j)
 	if err := a.store.persist(j); err != nil {
 		a.log.Warn("failed to persist job state", "job_id", j.ID, "error", err)
+		_ = a.store.remove(id)
+		writeError(w, http.StatusInternalServerError, "could not persist job")
+		return
 	}
-	select {
-	case a.queue <- j:
+	if err := a.queue.Enqueue(r.Context(), j.ID); err == nil {
 		keep = true
 		writeJSON(w, http.StatusAccepted, j.snapshot())
-	default:
+	} else {
+		message := "conversion queue is full"
+		if !errors.Is(err, errQueueFull) {
+			a.log.Warn("failed to enqueue job", "job_id", j.ID, "error", err)
+			message = "conversion queue is unavailable"
+		}
 		_ = a.store.remove(id)
-		writeError(w, http.StatusServiceUnavailable, "conversion queue is full")
+		writeError(w, http.StatusServiceUnavailable, message)
 	}
 }
 
@@ -277,7 +298,7 @@ func (a *App) validJob(id string) (*Job, bool) {
 	if _, err := uuid.Parse(id); err != nil {
 		return nil, false
 	}
-	j, ok := a.store.get(id)
+	j, ok := a.store.reload(id)
 	if !ok {
 		return nil, false
 	}
@@ -291,17 +312,48 @@ func (a *App) validJob(id string) (*Job, bool) {
 func (a *App) worker(index int) {
 	defer a.wg.Done()
 	for {
+		id, err := a.queue.Dequeue(a.ctx)
+		if err != nil {
+			if a.ctx.Err() != nil {
+				return
+			}
+			a.log.Warn("failed to dequeue job", "error", err, "worker", index)
+			continue
+		}
+		j, ok := a.store.reload(id)
+		if !ok {
+			a.log.Warn("queued job state is unavailable", "job_id", id, "worker", index)
+			a.ackJob(id, index)
+			continue
+		}
+		if status := j.snapshot().Status; status == Completed || status == Failed {
+			a.ackJob(id, index)
+			continue
+		}
 		select {
 		case <-a.ctx.Done():
 			return
-		case j := <-a.queue:
-			a.process(index, j)
+		default:
+		}
+		if a.process(index, j) {
+			a.ackJob(id, index)
 		}
 	}
 }
-func (a *App) process(index int, j *Job) {
+func (a *App) ackJob(id string, index int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := a.queue.Ack(ctx, id); err != nil {
+		a.log.Warn("failed to acknowledge job", "job_id", id, "worker", index, "error", err)
+	}
+}
+func (a *App) process(index int, j *Job) bool {
 	start := time.Now()
 	j.update(func(x *Job) { x.Status = Processing })
+	if err := a.store.persist(j); err != nil {
+		a.log.Warn("failed to persist processing state", "job_id", j.ID, "error", err)
+	}
+	_ = os.Remove(j.OutputPath)
 	ctx, cancel := context.WithTimeout(a.ctx, a.cfg.JobTimeout)
 	defer cancel()
 	err := a.converter.run(ctx, j.InputFormat, j.OutputFormat, j.InputPath, j.OutputPath)
@@ -318,6 +370,7 @@ func (a *App) process(index int, j *Job) {
 	})
 	if perr := a.store.persist(j); perr != nil {
 		a.log.Warn("failed to persist job state", "job_id", j.ID, "error", perr)
+		return false
 	}
 	a.metrics.jobsTotal.WithLabelValues(string(j.snapshot().Status), j.InputFormat, j.OutputFormat).Inc()
 	a.metrics.jobDuration.Observe(time.Since(start).Seconds())
@@ -327,6 +380,7 @@ func (a *App) process(index int, j *Job) {
 	} else {
 		a.log.Info("conversion completed", "job_id", j.ID, "input", j.InputFormat, "output", j.OutputFormat, "size", j.Size, "worker", index)
 	}
+	return true
 }
 func (a *App) janitor() {
 	defer a.wg.Done()

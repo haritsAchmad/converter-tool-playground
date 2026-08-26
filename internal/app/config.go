@@ -10,6 +10,7 @@ import (
 
 type Config struct {
 	Address, StorageRoot, ClamScanPath                 string
+	Mode, RedisURL, RedisQueue                         string
 	MaxUploadBytes                                     int64
 	Workers, QueueSize                                 int
 	JobTimeout, JobTTL, CleanupInterval, UploadTimeout time.Duration
@@ -30,6 +31,9 @@ func LoadConfig() (Config, error) {
 		UploadTimeout:   envDuration("CONVERTBOX_UPLOAD_TIMEOUT", 30*time.Second),
 		ClamScanPath:    os.Getenv("CONVERTBOX_CLAMSCAN"),
 		ScanTimeout:     envDuration("CONVERTBOX_SCAN_TIMEOUT", 15*time.Second),
+		Mode:            env("CONVERTBOX_MODE", "standalone"),
+		RedisURL:        os.Getenv("CONVERTBOX_REDIS_URL"),
+		RedisQueue:      env("CONVERTBOX_REDIS_QUEUE", "convertbox:jobs"),
 		RateRPS:         envFloat("CONVERTBOX_RATE_RPS", 1),
 		RateBurst:       envFloat("CONVERTBOX_RATE_BURST", 5),
 		MaxJobsPerIP:    envInt("CONVERTBOX_MAX_JOBS_PER_IP", 4),
@@ -39,6 +43,12 @@ func LoadConfig() (Config, error) {
 	}
 	if c.RateRPS <= 0 || c.RateBurst < 1 || c.MaxJobsPerIP < 1 {
 		return c, fmt.Errorf("rate rps/burst and max jobs per IP must be positive")
+	}
+	if c.Mode != "standalone" && c.Mode != "api" && c.Mode != "worker" {
+		return c, fmt.Errorf("mode must be standalone, api, or worker")
+	}
+	if c.Mode != "standalone" && c.RedisURL == "" {
+		return c, fmt.Errorf("redis URL is required in api and worker modes")
 	}
 	return c, nil
 }

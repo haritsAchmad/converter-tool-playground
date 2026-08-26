@@ -112,7 +112,7 @@ func TestMalwareScanRejectsBeforeQueue(t *testing.T) {
 	if w.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("expected malware rejection, got %d: %s", w.Code, w.Body.String())
 	}
-	if len(a.queue) != 0 {
+	if a.queue.Depth() != 0 {
 		t.Fatal("rejected upload reached conversion queue")
 	}
 }

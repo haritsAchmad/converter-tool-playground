@@ -39,6 +39,11 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if cfg.Mode == "worker" {
+		logger.Info("conversion worker started", "workers", cfg.Workers, "storage", cfg.StorageRoot)
+		<-ctx.Done()
+		return
+	}
 	go func() {
 		logger.Info("server started", "address", cfg.Address, "storage", cfg.StorageRoot)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

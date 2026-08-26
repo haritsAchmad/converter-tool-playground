@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -107,6 +108,44 @@ func TestInterruptedJobRecoveredAsFailed(t *testing.T) {
 	snap := recovered.snapshot()
 	if snap.Status != Failed {
 		t.Fatalf("expected interrupted job marked failed, got %s", snap.Status)
+	}
+}
+
+func TestSharedStoreReloadSeesWorkerUpdate(t *testing.T) {
+	root := t.TempDir()
+	apiStore, err := newStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerStore, err := newStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := "22222222-2222-2222-2222-222222222222"
+	dir := filepath.Join(root, id)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "input.bin"), []byte("a,b\n1,2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	j := &Job{ID: id, Status: Queued, InputFormat: "csv", OutputFormat: "json", OutputName: "result.json", CreatedAt: now, ExpiresAt: now.Add(time.Hour), InputPath: filepath.Join(dir, "input.bin"), OutputPath: filepath.Join(dir, "output.json"), mu: &sync.RWMutex{}}
+	apiStore.add(j)
+	if err := apiStore.persist(j); err != nil {
+		t.Fatal(err)
+	}
+	workerJob, ok := workerStore.reload(id)
+	if !ok {
+		t.Fatal("worker could not load API job state")
+	}
+	workerJob.update(func(job *Job) { job.Status = Completed })
+	if err := workerStore.persist(workerJob); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, ok := apiStore.reload(id)
+	if !ok || refreshed.snapshot().Status != Completed {
+		t.Fatal("API did not observe worker state update")
 	}
 }
 

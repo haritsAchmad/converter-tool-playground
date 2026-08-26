@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const jobStateFile = "job.json"
@@ -48,6 +50,15 @@ func (s *store) persist(j *Job) error {
 
 func (s *store) countActiveByIP(ip string) int {
 	s.mu.RLock()
+	ids := make([]string, 0, len(s.jobs))
+	for id := range s.jobs {
+		ids = append(ids, id)
+	}
+	s.mu.RUnlock()
+	for _, id := range ids {
+		_, _ = s.reload(id)
+	}
+	s.mu.RLock()
 	defer s.mu.RUnlock()
 	n := 0
 	for _, j := range s.jobs {
@@ -63,7 +74,7 @@ func (s *store) countActiveByIP(ip string) int {
 // previous process. Jobs still mid-flight at shutdown cannot be resumed, so
 // they are marked failed; completed/failed jobs already on disk are restored
 // as-is so their status and download remain available until they expire.
-func (s *store) recover(now time.Time, log *slog.Logger) {
+func (s *store) recover(now time.Time, log *slog.Logger, failQueued, failProcessing bool) {
 	entries, err := os.ReadDir(s.root)
 	if err != nil {
 		return
@@ -90,7 +101,7 @@ func (s *store) recover(now time.Time, log *slog.Logger) {
 			_ = os.RemoveAll(dir)
 			continue
 		}
-		if j.Status == Queued || j.Status == Processing {
+		if (j.Status == Queued && failQueued) || (j.Status == Processing && failProcessing) {
 			j.Status = Failed
 			j.Error = "interrupted by server restart"
 			finished := now
@@ -106,6 +117,44 @@ func (s *store) recover(now time.Time, log *slog.Logger) {
 			log.Info("recovered job from disk", "job_id", j.ID, "status", j.Status)
 		}
 	}
+}
+
+// reload refreshes one job from the shared storage volume. Split API and
+// worker processes do not share memory, so the sidecar is the source of truth.
+func (s *store) reload(id string) (*Job, bool) {
+	if _, err := uuid.Parse(id); err != nil || filepath.Base(id) != id {
+		return nil, false
+	}
+	s.mu.RLock()
+	existing := s.jobs[id]
+	s.mu.RUnlock()
+	dir := filepath.Join(s.root, id)
+	data, err := os.ReadFile(filepath.Join(dir, jobStateFile))
+	if err != nil {
+		return nil, false
+	}
+	var loaded Job
+	if err := json.Unmarshal(data, &loaded); err != nil || loaded.ID != id {
+		return nil, false
+	}
+	loaded.InputPath = filepath.Join(dir, "input.bin")
+	format, ok := formats[loaded.OutputFormat]
+	if !ok || len(format.Extensions) == 0 {
+		return nil, false
+	}
+	ext := format.Extensions[0]
+	if !strings.HasSuffix(strings.ToLower(loaded.OutputName), ext) {
+		return nil, false
+	}
+	loaded.OutputPath = filepath.Join(dir, "output"+ext)
+	loaded.mu = &sync.RWMutex{}
+	if existing != nil {
+		loaded.ClientIP = existing.snapshot().ClientIP
+	}
+	s.mu.Lock()
+	s.jobs[id] = &loaded
+	s.mu.Unlock()
+	return &loaded, true
 }
 func (s *store) get(id string) (*Job, bool) {
 	s.mu.RLock()

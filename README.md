@@ -20,7 +20,7 @@ With Docker (recommended):
 docker compose up --build
 ```
 
-Open <http://localhost:8080>. The compose profile runs as UID 10001 with a read-only root filesystem, drops all Linux capabilities, prevents privilege escalation, and limits CPU, memory, PIDs, and temporary storage.
+Open <http://localhost:8080>. Compose starts separate API and conversion-worker containers, a Redis-backed queue, and a shared job volume. Application containers run as UID 10001 with read-only root filesystems, drop all Linux capabilities, prevent privilege escalation, and limit CPU, memory, and PIDs.
 
 Run locally with Go 1.24+:
 
@@ -35,7 +35,10 @@ ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. F
 | Variable | Default | Purpose |
 |---|---:|---|
 | `CONVERTBOX_ADDR` | `:8080` | HTTP listen address |
+| `CONVERTBOX_MODE` | `standalone` | `standalone`, `api`, or `worker` process role |
 | `CONVERTBOX_STORAGE` | OS temp + `convertbox` | Isolated job root |
+| `CONVERTBOX_REDIS_URL` | empty | Redis URL; required in `api` and `worker` modes |
+| `CONVERTBOX_REDIS_QUEUE` | `convertbox:jobs` | Redis queue key prefix |
 | `CONVERTBOX_MAX_MB` | `25` | Per-upload limit |
 | `CONVERTBOX_WORKERS` | `2` | Concurrent conversions |
 | `CONVERTBOX_QUEUE_SIZE` | `20` | Bounded waiting queue |
@@ -81,10 +84,13 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 - Per-IP token-bucket rate limiting and a concurrent-job quota bound submission abuse from a single client; the client IP is read from the raw TCP connection, not from forwardable headers like `X-Forwarded-For`.
 - Cleanup verifies that targets are descendants of the converter root and refuses symlink job directories. Old orphan directories are removed after restart.
 - Job state is persisted to a `job.json` sidecar per job so status/downloads survive a restart. Jobs still in flight at shutdown are recovered as failed rather than silently resumed.
+- Split mode passes only opaque job UUIDs through Redis. API and worker share the isolated job volume; Redis keeps unacknowledged work in a processing list so a single restarted worker service can requeue it.
 - Logs contain job ID, formats, size, worker, and errors—not user file contents.
 - Downloads use `nosniff`, attachment disposition, and an opaque content type.
 
 This reduces risk; it does not make arbitrary hostile document processing safe. Keep conversion workers isolated from credentials and internal networks. For a public multi-tenant service, split API and workers into separate containers/VMs and add malware scanning, rate limits, quotas, and abuse controls.
+
+The Redis recovery model currently assumes one worker service (which may run several configured worker goroutines). Do not scale the worker service to multiple replicas until per-worker leases and stale-claim recovery are implemented.
 
 ## Development
 
