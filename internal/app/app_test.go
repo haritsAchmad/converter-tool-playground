@@ -77,6 +77,29 @@ func TestRejectsDisguisedExecutable(t *testing.T) {
 	}
 }
 
+func TestRejectsDisguisedActiveContent(t *testing.T) {
+	tests := []struct {
+		name     string
+		filename string
+		content  string
+	}{
+		{name: "unsupported PDF extension", filename: "invoice.pdf", content: "percent-PDF-not-supported"},
+		{name: "PHP content renamed to CSV", filename: "people.csv", content: "name,age\n<?php echo 1; ?>,1\n"},
+		{name: "blocked extension hidden before CSV", filename: "people.php.csv", content: "name,age\nAda,36\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "input.bin")
+			if err := os.WriteFile(path, []byte(tt.content), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := validateUpload(path, tt.filename); err == nil {
+				t.Fatalf("expected %q to be rejected", tt.filename)
+			}
+		})
+	}
+}
+
 func TestWithin(t *testing.T) {
 	root := t.TempDir()
 	if !within(root, filepath.Join(root, "job", "out")) {

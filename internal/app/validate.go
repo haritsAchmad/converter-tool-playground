@@ -20,7 +20,7 @@ var blockedExt = map[string]bool{".exe": true, ".dll": true, ".com": true, ".bat
 
 func validateUpload(path, original string) (string, error) {
 	ext := strings.ToLower(filepath.Ext(original))
-	if blockedExt[ext] {
+	if hasBlockedExtension(original) {
 		return "", errors.New("executable and script files are not accepted")
 	}
 	var candidate string
@@ -44,6 +44,9 @@ func validateUpload(path, original string) (string, error) {
 	head = head[:n]
 	if looksExecutable(head) {
 		return "", errors.New("file signature looks executable")
+	}
+	if err := rejectActiveContent(path); err != nil {
+		return "", err
 	}
 	mime := http.DetectContentType(head)
 	switch candidate {
@@ -77,6 +80,31 @@ func validateUpload(path, original string) (string, error) {
 	}
 	return candidate, nil
 }
+
+func hasBlockedExtension(name string) bool {
+	name = strings.ToLower(filepath.Base(name))
+	for ext := range blockedExt {
+		if strings.Contains(name, ext+".") || strings.HasSuffix(name, ext) {
+			return true
+		}
+	}
+	return false
+}
+
+func rejectActiveContent(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	lower := bytes.ToLower(b)
+	for _, marker := range [][]byte{[]byte("<?php"), []byte("<?=")} {
+		if bytes.Contains(lower, marker) {
+			return errors.New("active script content is not accepted")
+		}
+	}
+	return nil
+}
+
 func validateSyntax(format, path string) error {
 	b, err := os.ReadFile(path)
 	if err != nil {
