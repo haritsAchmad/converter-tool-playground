@@ -28,7 +28,7 @@ Run locally with Go 1.24+:
 go run ./cmd/convertbox
 ```
 
-ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. For a public deployment, run behind Caddy/Nginx with HTTPS, rate limiting, and an aligned request body limit.
+ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
 
 ## Configuration
 
@@ -96,6 +96,22 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 This reduces risk; it does not make arbitrary hostile document processing safe. Keep conversion workers isolated from credentials and internal networks. For a public multi-tenant service, split API and workers into separate containers/VMs and add malware scanning, rate limits, quotas, and abuse controls.
 
 The Redis recovery model currently assumes one worker service (which may run several configured worker goroutines). Do not scale the worker service to multiple replicas until per-worker leases and stale-claim recovery are implemented.
+
+## Deploying beyond localhost
+
+By default `docker compose up` binds `api` to `0.0.0.0:8080`—reachable from your LAN, not just this machine, if your firewall allows inbound connections. Before letting anyone but you reach it:
+
+1. **Set `CONVERTBOX_API_KEY`.** Without it, there is no authentication at all; a job's UUID is the only thing standing between a stranger and its output.
+2. **Put a TLS-terminating proxy in front of it.** Nothing in Convertbox itself speaks HTTPS. Bring one up with:
+
+   ```sh
+   CONVERTBOX_API_KEY=$(openssl rand -hex 32) docker compose --profile proxy up --build -d
+   ```
+
+   This starts a `caddy` service on ports 80/443 in addition to the usual stack; see [deploy/Caddyfile](deploy/Caddyfile) for both the public-domain (automatic Let's Encrypt) and internal/LAN (self-signed, on-demand) variants, and edit it to match your setup before relying on it. `api`'s own `8080:8080` mapping stays open too—drop it from `compose.yaml` once the proxy is your only intended entry point.
+
+3. **Know what a proxy does to the built-in rate limiting.** `CONVERTBOX_RATE_RPS`/`CONVERTBOX_RATE_BURST`/`CONVERTBOX_MAX_JOBS_PER_IP` key off the raw TCP peer address on purpose (a client can't spoof `X-Forwarded-For` to dodge its own limit). That also means once every request arrives via Caddy, every client shares one bucket—Caddy's container IP—instead of getting their own. For a small internal team this is usually a fine trade-off (worst case, one heavy user throttles the others, not an outage); it does mean the per-IP quotas stop being a meaningful abuse control once you're behind the proxy, so lean on the API key for that instead.
+4. **Keep `/metrics` off the public listener.** The bundled Caddyfile already 404s it; if you write your own proxy config, do the same; and don't skip `CONVERTBOX_API_KEY`, which also gates `/metrics` directly.
 
 ## Development
 

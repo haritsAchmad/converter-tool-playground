@@ -1,0 +1,67 @@
+# Reverse proxy for Convertbox: TLS termination in front of the `api`
+# service, with /metrics hidden from anything but the proxy's own network.
+#
+# Enable it with: docker compose --profile proxy up -d
+#
+# --- Public deployment (a real domain, automatic Let's Encrypt HTTPS) ---
+# Point convertbox.example.com's A/AAAA record at this host, open ports
+# 80/443 to the internet for the ACME challenge, then swap in this block
+# instead of the ":443" one below:
+#
+# convertbox.example.com {
+# 	reverse_proxy api:8080
+# 	@metrics path /metrics
+# 	respond @metrics 404
+# }
+#
+# --- Internal/LAN deployment (default below) ---
+# No public domain: Caddy issues a self-signed certificate on the fly for
+# whatever hostname or IP a client connects with. Browsers will warn on
+# first visit; either click through, or copy
+# /data/caddy/pki/authorities/local/root.crt out of the caddy-data volume
+# and import it into each client device's trust store to silence it.
+# (`caddy trust` won't work here: this container is read-only and has no
+# Linux capabilities beyond binding :80/:443, on purpose.)
+#
+# IMPORTANT: with this proxy in front, convertbox's per-IP rate limiting
+# and job quotas (CONVERTBOX_RATE_RPS/BURST, CONVERTBOX_MAX_JOBS_PER_IP)
+# start seeing every request as coming from Caddy's container IP, not the
+# real client—by design, convertbox never trusts a client-supplied
+# X-Forwarded-For for this. See the README's deployment section for what
+# that trade-off means and how to compensate for it.
+
+{
+	# Issue a self-signed cert on the fly for whatever hostname/IP a client
+	# connects with (localhost, a LAN IP, a .local name, ...). Caddy requires
+	# an `ask` gate before it will do this at all; ours approves every name
+	# unconditionally (see the :9999 block below), which is fine ONLY because
+	# this whole file is for a private/internal network—anyone who can reach
+	# the box is already trusted enough to request a cert for any name.
+	# Never reuse this on a public listener.
+	on_demand_tls {
+		ask http://localhost:9999/ask
+	}
+}
+
+# Loopback-only approval endpoint for the on_demand_tls check above; it
+# never leaves this container and always says yes.
+:9999 {
+	respond "ok" 200
+}
+
+:443 {
+	tls internal {
+		on_demand
+	}
+
+	reverse_proxy api:8080
+
+	# CONVERTBOX_API_KEY (if set) already protects /metrics, but keep
+	# scrape traffic off the public listener entirely as a second layer.
+	@metrics path /metrics
+	respond @metrics 404
+}
+
+:80 {
+	redir https://{host}{uri} permanent
+}

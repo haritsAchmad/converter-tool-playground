@@ -10,7 +10,7 @@
 - [x] Optional ClamAV stage before the conversion queue; fail closed when enabled.
 - [ ] Format-specific content-disarm stage for future complex document formats.
 - [x] Optional shared-secret `X-API-Key` authentication on the API and `/metrics`, with the web UI prompting for and remembering the key.
-- [ ] Documented reverse-proxy config (TLS termination) for deployments reachable beyond localhost, since the API key alone doesn't protect traffic in transit.
+- [x] Documented reverse-proxy config (TLS termination) for deployments reachable beyond localhost, since the API key alone doesn't protect traffic in transit.
 
 ## 0.3 — more engines
 
