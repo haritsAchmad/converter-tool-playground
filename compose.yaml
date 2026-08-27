@@ -9,6 +9,7 @@ services:
 
   redis:
     image: redis:8-alpine
+    user: "999:1000"
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data

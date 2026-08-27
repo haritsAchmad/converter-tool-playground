@@ -9,6 +9,7 @@
 - [x] Separate API and conversion worker containers with a Redis-backed queue and shared job storage.
 - [x] Optional ClamAV stage before the conversion queue; fail closed when enabled.
 - [ ] Format-specific content-disarm stage for future complex document formats.
+- [ ] Authentication layer (API key or basic auth) and a documented reverse-proxy config (TLS termination, `/metrics` restricted to internal scrape only) before this is exposed beyond localhost. Today there is no auth at all—job UUIDs are the only access control, and `/metrics` is open to anyone who can reach the port.
 
 ## 0.3 — more engines
 

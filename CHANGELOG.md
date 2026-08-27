@@ -4,6 +4,10 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [Unreleased]
 
+### Fixed
+
+- `compose.yaml`: the `redis` service dropped all Linux capabilities but the official `redis:8-alpine` entrypoint needs `CAP_SETUID`/`CAP_SETGID` to drop from root to its `redis` (999:1000) user before writing to `/data`. Without those caps it silently kept running as root, which then lacked `CAP_DAC_OVERRIDE` to write into the image's `999:1000`-owned data directory, so `redis-server` failed to create `appendonlydir` and the whole stack refused to start. Fixed by pinning `user: "999:1000"` on the service so it starts as the right identity directly, bypassing the entrypoint's privilege-drop path entirely.
+
 ### Added
 
 - Restart-safe job state: each job persists a `job.json` sidecar next to its files, and the server rebuilds its in-memory job map from disk on startup so status/download keep working after a restart. Jobs still queued or processing at shutdown are recovered as failed since they cannot be resumed.
