@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Address, StorageRoot, ClamScanPath                 string
 	Mode, RedisURL, RedisQueue                         string
+	APIKey                                             string
 	MaxUploadBytes                                     int64
 	Workers, QueueSize                                 int
 	JobTimeout, JobTTL, CleanupInterval, UploadTimeout time.Duration
@@ -30,6 +31,7 @@ func LoadConfig() (Config, error) {
 		CleanupInterval: envDuration("CONVERTBOX_CLEANUP_INTERVAL", time.Minute),
 		UploadTimeout:   envDuration("CONVERTBOX_UPLOAD_TIMEOUT", 30*time.Second),
 		ClamScanPath:    os.Getenv("CONVERTBOX_CLAMSCAN"),
+		APIKey:          os.Getenv("CONVERTBOX_API_KEY"),
 		ScanTimeout:     envDuration("CONVERTBOX_SCAN_TIMEOUT", 15*time.Second),
 		Mode:            env("CONVERTBOX_MODE", "standalone"),
 		RedisURL:        os.Getenv("CONVERTBOX_REDIS_URL"),

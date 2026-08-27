@@ -16,6 +16,10 @@
       <p class="intro">Converter kecil yang tahu batas. Upload, pilih format, unduh—lalu file menghilang sendiri.</p>
     </section>
     <section class="card">
+      <div id="auth" class="auth" hidden>
+        <label>API KEY <span>(diminta server ini)</span><input id="api-key" type="password" placeholder="masukkan API key" autocomplete="off"></label>
+        <button id="auth-save" type="button"><span>SIMPAN &amp; LANJUT</span><b>→</b></button>
+      </div>
       <form id="form">
         <label class="drop" id="drop" for="file">
           <input id="file" name="file" type="file" required>

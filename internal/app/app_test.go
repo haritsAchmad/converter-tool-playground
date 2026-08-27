@@ -117,6 +117,41 @@ func TestMalwareScanRejectsBeforeQueue(t *testing.T) {
 	}
 }
 
+func TestAPIKeyRequiredWhenConfigured(t *testing.T) {
+	cfg := Config{Address: ":0", StorageRoot: t.TempDir(), MaxUploadBytes: 1 << 20, Workers: 1, QueueSize: 2, JobTimeout: time.Second, JobTTL: time.Minute, CleanupInterval: time.Hour, UploadTimeout: time.Second, RateRPS: 100, RateBurst: 100, MaxJobsPerIP: 100, APIKey: "s3cret"}
+	a, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+
+	get := func(key string) int {
+		r := httptest.NewRequest(http.MethodGet, "/api/v1/formats", nil)
+		if key != "" {
+			r.Header.Set("X-API-Key", key)
+		}
+		w := httptest.NewRecorder()
+		a.Handler().ServeHTTP(w, r)
+		return w.Code
+	}
+	if code := get(""); code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without key, got %d", code)
+	}
+	if code := get("wrong"); code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with wrong key, got %d", code)
+	}
+	if code := get("s3cret"); code != http.StatusOK {
+		t.Fatalf("expected 200 with correct key, got %d", code)
+	}
+
+	r := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	w := httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected healthz to stay open without a key, got %d", w.Code)
+	}
+}
+
 func TestWithin(t *testing.T) {
 	root := t.TempDir()
 	if !within(root, filepath.Join(root, "job", "out")) {

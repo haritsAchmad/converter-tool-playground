@@ -51,6 +51,7 @@ ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. F
 | `CONVERTBOX_MAX_JOBS_PER_IP` | `4` | Max concurrent (queued/processing) jobs per IP |
 | `CONVERTBOX_CLAMSCAN` | disabled | Path or command name for an optional `clamscan` executable |
 | `CONVERTBOX_SCAN_TIMEOUT` | `15s` | Per-upload antivirus scan deadline |
+| `CONVERTBOX_API_KEY` | disabled | When set, every `/api/v1/*` and `/metrics` request must send it back as `X-API-Key`; the bundled web UI prompts for it and remembers it in the browser. Leave unset for local/trusted-network use |
 
 Durations use Go syntax such as `30s` and `10m`.
 
@@ -65,10 +66,13 @@ Durations use Go syntax such as `30s` and `10m`.
 
 Every response carries an `X-Request-ID` header (echoed back if the caller supplies a well-formed one) for correlating logs.
 
+When `CONVERTBOX_API_KEY` is set, every `/api/v1/*` and `/metrics` request needs an `X-API-Key` header matching it, or it gets `401`; `/healthz` and the static web UI stay open so the page can load and prompt for the key.
+
 Example:
 
 ```sh
 curl -F file=@people.csv -F outputFormat=json -F outputName=people \
+  -H "X-API-Key: $CONVERTBOX_API_KEY" \
   http://localhost:8080/api/v1/jobs
 ```
 
@@ -87,6 +91,7 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 - Split mode passes only opaque job UUIDs through Redis. API and worker share the isolated job volume; Redis keeps unacknowledged work in a processing list so a single restarted worker service can requeue it.
 - Logs contain job ID, formats, size, worker, and errors—not user file contents.
 - Downloads use `nosniff`, attachment disposition, and an opaque content type.
+- Optional shared-secret `X-API-Key` gate (`CONVERTBOX_API_KEY`) on the whole API and `/metrics`, compared in constant time; disabled by default since a lone-user local instance has no one else to authenticate.
 
 This reduces risk; it does not make arbitrary hostile document processing safe. Keep conversion workers isolated from credentials and internal networks. For a public multi-tenant service, split API and workers into separate containers/VMs and add malware scanning, rate limits, quotas, and abuse controls.
 

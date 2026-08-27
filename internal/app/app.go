@@ -91,11 +91,11 @@ func (a *App) Close() {
 func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	mux.HandleFunc("GET /api/v1/formats", a.getFormats)
-	mux.Handle("POST /api/v1/jobs", a.rateLimitJobs(a.createJob))
-	mux.HandleFunc("GET /api/v1/jobs/{id}", a.getJob)
-	mux.HandleFunc("GET /api/v1/jobs/{id}/download", a.download)
-	mux.Handle("GET /metrics", promhttp.HandlerFor(a.registry, promhttp.HandlerOpts{}))
+	mux.HandleFunc("GET /api/v1/formats", a.requireAPIKey(a.getFormats))
+	mux.HandleFunc("POST /api/v1/jobs", a.requireAPIKey(a.rateLimitJobs(a.createJob)))
+	mux.HandleFunc("GET /api/v1/jobs/{id}", a.requireAPIKey(a.getJob))
+	mux.HandleFunc("GET /api/v1/jobs/{id}/download", a.requireAPIKey(a.download))
+	mux.Handle("GET /metrics", a.requireAPIKey(promhttp.HandlerFor(a.registry, promhttp.HandlerOpts{}).ServeHTTP))
 	static, _ := fs.Sub(webFiles, "web")
 	mux.Handle("/", http.FileServer(http.FS(static)))
 

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"crypto/subtle"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -89,6 +90,21 @@ func (a *App) rateLimitJobs(next http.HandlerFunc) http.HandlerFunc {
 			a.metrics.rateLimited.Inc()
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded, slow down")
 			return
+		}
+		next(w, r)
+	}
+}
+
+// requireAPIKey gates a handler behind CONVERTBOX_API_KEY when it is set;
+// with no key configured, the API stays open as before (e.g. local dev).
+func (a *App) requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.APIKey != "" {
+			got := r.Header.Get("X-API-Key")
+			if subtle.ConstantTimeCompare([]byte(got), []byte(a.cfg.APIKey)) != 1 {
+				writeError(w, http.StatusUnauthorized, "missing or invalid API key")
+				return
+			}
 		}
 		next(w, r)
 	}

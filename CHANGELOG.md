@@ -10,6 +10,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Added
 
+- Optional shared-secret authentication: when `CONVERTBOX_API_KEY` is set, every `/api/v1/*` and `/metrics` request must send it back as `X-API-Key` (compared in constant time) or gets `401`. `/healthz` and the static web UI stay open. The bundled web UI now prompts for the key on a `401`, remembers it in `localStorage`, and sends it on every request—including downloads, which switched from a plain `<a href>` link to a `fetch` + blob so the header can actually be attached.
 - Restart-safe job state: each job persists a `job.json` sidecar next to its files, and the server rebuilds its in-memory job map from disk on startup so status/download keep working after a restart. Jobs still queued or processing at shutdown are recovered as failed since they cannot be resumed.
 - Per-IP token-bucket rate limiting on job submission (`CONVERTBOX_RATE_RPS`, `CONVERTBOX_RATE_BURST`) and a concurrent-job quota per IP (`CONVERTBOX_MAX_JOBS_PER_IP`).
 - Request IDs (`X-Request-ID`) on every response, structured access logging, Prometheus metrics at `GET /metrics`, and OpenTelemetry HTTP instrumentation wired to the global (no-op by default) tracer provider.
