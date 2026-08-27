@@ -22,7 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type converter struct{ magick string }
+type converter struct{ magick, pdftoppm string }
 
 var formats = map[string]Format{
 	"csv":      {"csv", "CSV", "Data", []string{".csv"}},
@@ -34,12 +34,17 @@ var formats = map[string]Format{
 	"webp":     {"webp", "WebP", "Image", []string{".webp"}},
 	"markdown": {"markdown", "Markdown", "Document", []string{".md", ".markdown"}},
 	"html":     {"html", "HTML", "Document", []string{".html", ".htm"}},
+	"pdf":      {"pdf", "PDF", "Document", []string{".pdf"}},
 }
 
 var dataFormats = map[string]bool{"csv": true, "json": true, "xml": true, "yaml": true}
 var imageFormats = map[string]bool{"png": true, "jpeg": true, "webp": true}
 
-func newConverter() *converter { p, _ := exec.LookPath("magick"); return &converter{magick: p} }
+func newConverter() *converter {
+	magick, _ := exec.LookPath("magick")
+	pdftoppm, _ := exec.LookPath("pdftoppm")
+	return &converter{magick: magick, pdftoppm: pdftoppm}
+}
 
 func (c *converter) capabilities() []publicFormat {
 	result := make([]publicFormat, 0, len(formats))
@@ -67,6 +72,9 @@ func (c *converter) supports(in, out string) bool {
 	if (in == "markdown" && out == "html") || (in == "html" && out == "markdown") {
 		return true
 	}
+	if in == "pdf" && (out == "png" || out == "jpeg") {
+		return c.pdftoppm != ""
+	}
 	if imageFormats[in] && imageFormats[out] {
 		if in == "webp" || out == "webp" {
 			return c.magick != ""
@@ -83,10 +91,43 @@ func (c *converter) run(ctx context.Context, in, out, inPath, outPath string) er
 	if dataFormats[in] {
 		return convertData(in, out, inPath, outPath)
 	}
+	if in == "pdf" {
+		return c.convertPDF(ctx, out, inPath, outPath)
+	}
 	if imageFormats[in] {
 		return c.convertImage(ctx, in, out, inPath, outPath)
 	}
 	return convertDocument(in, out, inPath, outPath)
+}
+
+// convertPDF renders only the first page of the PDF (a bounded, single-file
+// output keeps this a plain 1-job-1-output-file conversion like every other
+// format here) via poppler's pdftoppm: a mature, actively CVE-patched
+// renderer, run out-of-process with a job deadline so a hostile PDF can burn
+// at most that much wall time before it's killed.
+func (c *converter) convertPDF(ctx context.Context, out, inPath, outPath string) error {
+	if c.pdftoppm == "" {
+		return errors.New("PDF rendering is not available")
+	}
+	args := []string{"-f", "1", "-l", "1", "-r", "150", "-singlefile"}
+	if out == "jpeg" {
+		args = append(args, "-jpeg")
+	} else {
+		args = append(args, "-png")
+	}
+	root := strings.TrimSuffix(outPath, filepath.Ext(outPath))
+	args = append(args, inPath, root)
+	cmd := exec.CommandContext(ctx, c.pdftoppm, args...)
+	cmd.Dir = filepath.Dir(inPath)
+	cmd.Env = []string{"PATH=" + filepath.Dir(c.pdftoppm)}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("PDF rendering failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if info, statErr := os.Stat(outPath); statErr != nil || !info.Mode().IsRegular() {
+		return errors.New("PDF rendering produced no output (empty or encrypted PDF?)")
+	}
+	return nil
 }
 
 func convertDocument(in, out, inPath, outPath string) error {

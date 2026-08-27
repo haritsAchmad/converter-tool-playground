@@ -9,8 +9,9 @@ Small, self-hosted file conversion service with deliberately short-lived storage
 | Structured data | CSV, JSON, XML, YAML | CSV output requires an array of flat objects. XML uses a deterministic generic representation. |
 | Images | PNG, JPEG/JPG, WebP | PNG↔JPEG is native Go. WebP appears only when ImageMagick is installed. Metadata is stripped on ImageMagick conversions. |
 | Documents | Markdown, HTML | Markdown output is a best-effort semantic conversion. |
+| PDF | PDF → PNG/JPEG | Renders the first page only, at a fixed 150 DPI, via poppler's `pdftoppm`; appears only when it's installed. Full-document rendering and PDF as an output format are future work. |
 
-The API returns capabilities at runtime, so unavailable engines are not advertised. Office/PDF/audio/video are intentionally not enabled in this first release; see [ROADMAP.md](ROADMAP.md).
+The API returns capabilities at runtime, so unavailable engines are not advertised. Office documents/audio/video are intentionally not enabled in this first release; see [ROADMAP.md](ROADMAP.md).
 
 ## Quick start
 
@@ -28,7 +29,7 @@ Run locally with Go 1.24+:
 go run ./cmd/convertbox
 ```
 
-ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
+ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; poppler-utils is likewise optional and enables PDF→image when `pdftoppm` is on `PATH`. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
 
 ## Configuration
 
@@ -80,6 +81,7 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 
 - Extension, detected MIME, magic bytes, and syntax/header validation are combined; filenames alone are never trusted.
 - CSV output quote-escapes cells that open with `=`, `+`, `-`, `@`, tab, or CR, so a converted value can't be interpreted as a formula/DDE command when opened in a spreadsheet (OWASP "CSV Injection"). The YAML and JSON decoders reject alias bombs and pathologically deep nesting outright rather than exhausting memory or the stack.
+- PDF input must clear two independent parsers before conversion: a magic-byte check, then a full structural validation pass with pdfcpu (pure Go, no cgo)—separate from the native `pdftoppm` renderer that actually touches the file afterward, so a PDF crafted to exploit one specific parser's bug is much less likely to also cleanly validate against the other. Rendering is capped to the first page at a fixed DPI and bounded by the same job timeout as everything else.
 - Executable/script extensions and common executable signatures are rejected.
 - When `CONVERTBOX_CLAMSCAN` is configured, uploads must pass ClamAV before entering the conversion queue. Detection rejects the upload; scanner errors and timeouts fail closed.
 - Uploads are streamed into mode `0600` UUID job directories (mode `0700`) under one normalized storage root.

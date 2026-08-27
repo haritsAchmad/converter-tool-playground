@@ -15,10 +15,12 @@
 
 ## 0.3 — more engines
 
-- PDF transformations through a tightly sandboxed dedicated worker.
-- DOCX/ODT/PDF via LibreOffice and Pandoc with macros, network, and risky coders disabled.
-- Audio/video through FFmpeg with probe limits and codec whitelists.
-- SVG only after a dedicated sanitizer and rasterization boundary.
+- [x] PDF → PNG/JPEG (first page, fixed DPI) via poppler's `pdftoppm`, gated behind a second, independent structural validation pass (pdfcpu) so a hostile PDF has to fool two different parsers, not one.
+- [ ] Move PDF conversion into its own isolated worker/queue instead of the shared worker pool, for real blast-radius containment if the renderer is ever exploited—deliberately deferred as a lighter first slice; revisit once there's a reason to believe the shared pool isn't enough.
+- [ ] Multi-page PDF output (currently first-page-only, since a job produces exactly one output file today) and PDF as an output format.
+- [ ] DOCX/ODT/PDF via LibreOffice and Pandoc with macros, network, and risky coders disabled.
+- [ ] Audio/video through FFmpeg with probe limits and codec whitelists.
+- [ ] SVG only after a dedicated sanitizer and rasterization boundary.
 
 ## Later
 

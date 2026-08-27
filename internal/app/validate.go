@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
@@ -13,6 +14,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"gopkg.in/yaml.v3"
 )
 
@@ -61,6 +64,10 @@ func validateUpload(path, original string) (string, error) {
 	case "webp":
 		if len(head) < 12 || string(head[:4]) != "RIFF" || string(head[8:12]) != "WEBP" {
 			return "", errors.New("extension and WebP signature do not match")
+		}
+	case "pdf":
+		if !bytes.HasPrefix(head, []byte("%PDF-")) {
+			return "", errors.New("extension and PDF signature do not match")
 		}
 	default:
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
@@ -126,6 +133,14 @@ func validateSyntax(format, path string) error {
 		if err != nil {
 			return err
 		}
+	case "pdf":
+		// Structural validation with a second, independent parser (pdfcpu,
+		// pure Go) before the file ever reaches the native pdftoppm
+		// renderer: a PDF crafted to exploit one specific parser's bug is
+		// much less likely to also cleanly validate against a different one.
+		if err := api.Validate(bytes.NewReader(b), model.NewDefaultConfiguration()); err != nil {
+			return fmt.Errorf("invalid PDF structure: %w", err)
+		}
 	}
 	return nil
 }
@@ -142,6 +157,9 @@ func mimeAllowed(format, mime string) bool {
 		case "webp":
 			return mime == "image/webp" || mime == "application/octet-stream"
 		}
+	}
+	if format == "pdf" {
+		return mime == "application/pdf"
 	}
 	return strings.HasPrefix(mime, "text/") || mime == "application/json" || mime == "application/xml" || mime == "application/octet-stream"
 }

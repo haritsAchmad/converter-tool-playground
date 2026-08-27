@@ -84,7 +84,7 @@ func TestRejectsDisguisedActiveContent(t *testing.T) {
 		filename string
 		content  string
 	}{
-		{name: "unsupported PDF extension", filename: "invoice.pdf", content: "percent-PDF-not-supported"},
+		{name: "PDF without a real PDF signature", filename: "invoice.pdf", content: "percent-PDF-not-supported"},
 		{name: "PHP content renamed to CSV", filename: "people.csv", content: "name,age\n<?php echo 1; ?>,1\n"},
 		{name: "blocked extension hidden before CSV", filename: "people.php.csv", content: "name,age\nAda,36\n"},
 	}
