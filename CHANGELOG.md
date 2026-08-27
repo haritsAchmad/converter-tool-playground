@@ -6,6 +6,7 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ### Fixed
 
+- CSV output (from JSON/XML/YAML input) now quote-escapes cells starting with `=`, `+`, `-`, `@`, tab, or CR before writing them, closing an OWASP "CSV Injection" hole: an attacker-controlled field value like `=cmd|' /C calc'!A0` used to reach the exported `.csv` byte-for-byte, ready to run as a formula/DDE command the moment someone opened it in Excel, Sheets, or LibreOffice. Added regression tests, plus tests confirming (they already passed without a code change) that the YAML and JSON decoders reject alias bombs and deeply nested input instead of hanging or exhausting memory.
 - `compose.yaml`: the `redis` service dropped all Linux capabilities but the official `redis:8-alpine` entrypoint needs `CAP_SETUID`/`CAP_SETGID` to drop from root to its `redis` (999:1000) user before writing to `/data`. Without those caps it silently kept running as root, which then lacked `CAP_DAC_OVERRIDE` to write into the image's `999:1000`-owned data directory, so `redis-server` failed to create `appendonlydir` and the whole stack refused to start. Fixed by pinning `user: "999:1000"` on the service so it starts as the right identity directly, bypassing the entrypoint's privilege-drop path entirely.
 
 ### Added

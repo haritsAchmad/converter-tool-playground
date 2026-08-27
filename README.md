@@ -79,6 +79,7 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 ## Security model
 
 - Extension, detected MIME, magic bytes, and syntax/header validation are combined; filenames alone are never trusted.
+- CSV output quote-escapes cells that open with `=`, `+`, `-`, `@`, tab, or CR, so a converted value can't be interpreted as a formula/DDE command when opened in a spreadsheet (OWASP "CSV Injection"). The YAML and JSON decoders reject alias bombs and pathologically deep nesting outright rather than exhausting memory or the stack.
 - Executable/script extensions and common executable signatures are rejected.
 - When `CONVERTBOX_CLAMSCAN` is configured, uploads must pass ClamAV before entering the conversion queue. Detection rejects the upload; scanner errors and timeouts fail closed.
 - Uploads are streamed into mode `0600` UUID job directories (mode `0700`) under one normalized storage root.

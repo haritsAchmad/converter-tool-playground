@@ -261,7 +261,11 @@ func encodeCSV(v any) ([]byte, error) {
 	sortStrings(head)
 	var buf bytes.Buffer
 	w := csv.NewWriter(&buf)
-	_ = w.Write(head)
+	rawHead := make([]string, len(head))
+	for i, h := range head {
+		rawHead[i] = defuseCSVFormula(h)
+	}
+	_ = w.Write(rawHead)
 	for _, item := range items {
 		rowMap, ok := item.(map[string]any)
 		if !ok {
@@ -277,7 +281,7 @@ func encodeCSV(v any) ([]byte, error) {
 			case map[string]any, []any:
 				return nil, errors.New("CSV does not support nested values")
 			}
-			row[i] = scalarString(val)
+			row[i] = defuseCSVFormula(scalarString(val))
 		}
 		if err := w.Write(row); err != nil {
 			return nil, err
@@ -285,6 +289,22 @@ func encodeCSV(v any) ([]byte, error) {
 	}
 	w.Flush()
 	return buf.Bytes(), w.Error()
+}
+
+// defuseCSVFormula guards against CSV/formula injection: a cell that opens
+// with =, +, -, @, tab, or CR is interpreted as a formula by Excel, Sheets,
+// and LibreOffice when the file is later opened, which can run commands or
+// exfiltrate data (OWASP "CSV Injection"). Prefixing it with a quote keeps
+// the value intact as inert text instead.
+func defuseCSVFormula(s string) string {
+	if s == "" {
+		return s
+	}
+	switch s[0] {
+	case '=', '+', '-', '@', '\t', '\r':
+		return "'" + s
+	}
+	return s
 }
 func scalarString(v any) string {
 	if v == nil {
