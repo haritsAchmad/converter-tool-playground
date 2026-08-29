@@ -7,7 +7,9 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/convertbox ./cmd/convertbox
 
 FROM alpine:3.22
-RUN apk add --no-cache imagemagick poppler-utils ca-certificates && addgroup -S app && adduser -S -G app -u 10001 app
+RUN apk add --no-cache imagemagick poppler-utils libreoffice-writer libreoffice-calc libreoffice-impress \
+    font-liberation font-dejavu font-noto ca-certificates && \
+    addgroup -S app && adduser -S -G app -u 10001 app
 COPY deploy/imagemagick-policy.xml /etc/ImageMagick-7/policy.xml
 COPY --from=build /out/convertbox /usr/local/bin/convertbox
 USER 10001:10001

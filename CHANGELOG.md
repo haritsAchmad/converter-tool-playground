@@ -4,6 +4,15 @@ All notable changes follow [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 ## [Unreleased]
 
+### Added
+
+- Runtime-detected DOCX, XLSX, and PPTX to PDF conversion through headless LibreOffice.
+- Bounded OOXML package validation that rejects macros, ActiveX, embedded objects, traversal paths, and external non-hyperlink resources before conversion.
+
+### Changed
+
+- Office conversions use private temporary LibreOffice profiles, and the container includes common metric-compatible fonts.
+
 ### Fixed
 
 - CSV output (from JSON/XML/YAML input) now quote-escapes cells starting with `=`, `+`, `-`, `@`, tab, or CR before writing them, closing an OWASP "CSV Injection" hole: an attacker-controlled field value like `=cmd|' /C calc'!A0` used to reach the exported `.csv` byte-for-byte, ready to run as a formula/DDE command the moment someone opened it in Excel, Sheets, or LibreOffice. Added regression tests, plus tests confirming (they already passed without a code change) that the YAML and JSON decoders reject alias bombs and deeply nested input instead of hanging or exhausting memory.

@@ -12,9 +12,11 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	md "github.com/JohannesKaufmann/html-to-markdown/v2"
@@ -22,7 +24,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type converter struct{ magick, pdftoppm string }
+type converter struct{ magick, pdftoppm, libreoffice string }
 
 var formats = map[string]Format{
 	"csv":      {"csv", "CSV", "Data", []string{".csv"}},
@@ -35,15 +37,23 @@ var formats = map[string]Format{
 	"markdown": {"markdown", "Markdown", "Document", []string{".md", ".markdown"}},
 	"html":     {"html", "HTML", "Document", []string{".html", ".htm"}},
 	"pdf":      {"pdf", "PDF", "Document", []string{".pdf"}},
+	"docx":     {"docx", "Word (DOCX)", "Office", []string{".docx"}},
+	"xlsx":     {"xlsx", "Excel (XLSX)", "Office", []string{".xlsx"}},
+	"pptx":     {"pptx", "PowerPoint (PPTX)", "Office", []string{".pptx"}},
 }
 
 var dataFormats = map[string]bool{"csv": true, "json": true, "xml": true, "yaml": true}
 var imageFormats = map[string]bool{"png": true, "jpeg": true, "webp": true}
+var officeFormats = map[string]bool{"docx": true, "xlsx": true, "pptx": true}
 
 func newConverter() *converter {
 	magick, _ := exec.LookPath("magick")
 	pdftoppm, _ := exec.LookPath("pdftoppm")
-	return &converter{magick: magick, pdftoppm: pdftoppm}
+	libreoffice, _ := exec.LookPath("libreoffice")
+	if libreoffice == "" {
+		libreoffice, _ = exec.LookPath("soffice")
+	}
+	return &converter{magick: magick, pdftoppm: pdftoppm, libreoffice: libreoffice}
 }
 
 func (c *converter) capabilities() []publicFormat {
@@ -75,6 +85,9 @@ func (c *converter) supports(in, out string) bool {
 	if in == "pdf" && (out == "png" || out == "jpeg") {
 		return c.pdftoppm != ""
 	}
+	if officeFormats[in] && out == "pdf" {
+		return c.libreoffice != ""
+	}
 	if imageFormats[in] && imageFormats[out] {
 		if in == "webp" || out == "webp" {
 			return c.magick != ""
@@ -97,7 +110,89 @@ func (c *converter) run(ctx context.Context, in, out, inPath, outPath string) er
 	if imageFormats[in] {
 		return c.convertImage(ctx, in, out, inPath, outPath)
 	}
+	if officeFormats[in] {
+		return c.convertOffice(ctx, in, inPath, outPath)
+	}
 	return convertDocument(in, out, inPath, outPath)
+}
+
+// convertOffice runs LibreOffice with a fresh per-job profile. The uploaded
+// file is staged with its verified extension because job storage deliberately
+// uses an opaque input.bin name and LibreOffice's filter detection is more
+// deterministic when the OOXML extension is present.
+func (c *converter) convertOffice(ctx context.Context, in, inPath, outPath string) error {
+	if c.libreoffice == "" {
+		return errors.New("Office conversion is not available")
+	}
+	workDir, err := os.MkdirTemp(filepath.Dir(inPath), ".libreoffice-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workDir)
+	if err := os.Chmod(workDir, 0700); err != nil {
+		return err
+	}
+	staged := filepath.Join(workDir, "input."+in)
+	if err := copyPrivateFile(inPath, staged); err != nil {
+		return err
+	}
+	profile := filepath.Join(workDir, "profile")
+	if err := os.Mkdir(profile, 0700); err != nil {
+		return err
+	}
+	profileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(profile)}).String()
+	cmd := exec.CommandContext(ctx, c.libreoffice,
+		"--headless", "--invisible", "--nologo", "--nodefault", "--nolockcheck", "--norestore",
+		"-env:UserInstallation="+profileURL,
+		"--convert-to", "pdf", "--outdir", workDir, staged,
+	)
+	cmd.Dir = workDir
+	cmd.Env = officeEnvironment(c.libreoffice, workDir)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("Office conversion failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	generated := filepath.Join(workDir, "input.pdf")
+	info, err := os.Stat(generated)
+	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
+		return fmt.Errorf("Office conversion produced no PDF (%s)", strings.TrimSpace(string(output)))
+	}
+	if err := os.Rename(generated, outPath); err != nil {
+		return err
+	}
+	return os.Chmod(outPath, 0600)
+}
+
+func officeEnvironment(executable, workDir string) []string {
+	path := filepath.Dir(executable)
+	if runtime.GOOS == "windows" {
+		// The native Windows launcher may rely on system DLL/helper lookup.
+		// Arguments remain fixed and are never passed through a shell.
+		path += string(os.PathListSeparator) + os.Getenv("PATH")
+	} else {
+		// Alpine's /usr/bin/libreoffice is a shell wrapper that calls ls, sed,
+		// grep, and uname from /bin before it reaches the real binary.
+		path += ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+	}
+	return []string{"HOME=" + workDir, "PATH=" + path, "LANG=C.UTF-8"}
+}
+
+func copyPrivateFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
 
 // convertPDF renders only the first page of the PDF (a bounded, single-file

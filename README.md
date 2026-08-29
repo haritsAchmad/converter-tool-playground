@@ -9,9 +9,10 @@ Small, self-hosted file conversion service with deliberately short-lived storage
 | Structured data | CSV, JSON, XML, YAML | CSV output requires an array of flat objects. XML uses a deterministic generic representation. |
 | Images | PNG, JPEG/JPG, WebP | PNG↔JPEG is native Go. WebP appears only when ImageMagick is installed. Metadata is stripped on ImageMagick conversions. |
 | Documents | Markdown, HTML | Markdown output is a best-effort semantic conversion. |
+| Office | DOCX, XLSX, PPTX → PDF | Uses isolated, headless LibreOffice profiles. Complex Microsoft-specific layout may render differently. |
 | PDF | PDF → PNG/JPEG | Renders the first page only, at a fixed 150 DPI, via poppler's `pdftoppm`; appears only when it's installed. Full-document rendering and PDF as an output format are future work. |
 
-The API returns capabilities at runtime, so unavailable engines are not advertised. Office documents/audio/video are intentionally not enabled in this first release; see [ROADMAP.md](ROADMAP.md).
+The API returns capabilities at runtime, so unavailable engines are not advertised. PDF-to-Office, legacy Office formats, macro-enabled documents, audio, and video are intentionally not enabled; see [ROADMAP.md](ROADMAP.md).
 
 ## Quick start
 
@@ -29,7 +30,7 @@ Run locally with Go 1.24+:
 go run ./cmd/convertbox
 ```
 
-ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; poppler-utils is likewise optional and enables PDF→image when `pdftoppm` is on `PATH`. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
+ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; poppler-utils likewise enables PDF→image when `pdftoppm` is on `PATH`; and LibreOffice enables DOCX/XLSX/PPTX→PDF when `libreoffice` or `soffice` is on `PATH`. The Docker image includes all three. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
 
 ## Configuration
 
@@ -83,6 +84,7 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 - CSV output quote-escapes cells that open with `=`, `+`, `-`, `@`, tab, or CR, so a converted value can't be interpreted as a formula/DDE command when opened in a spreadsheet (OWASP "CSV Injection"). The YAML and JSON decoders reject alias bombs and pathologically deep nesting outright rather than exhausting memory or the stack.
 - PDF input must clear two independent parsers before conversion: a magic-byte check, then a full structural validation pass with pdfcpu (pure Go, no cgo)—separate from the native `pdftoppm` renderer that actually touches the file afterward, so a PDF crafted to exploit one specific parser's bug is much less likely to also cleanly validate against the other. Rendering is capped to the first page at a fixed DPI and bounded by the same job timeout as everything else.
 - Executable/script extensions and common executable signatures are rejected.
+- OOXML input must be a plausible ZIP package of the matching family. Entry count, expanded size, compression ratio, and paths are bounded; macros, ActiveX, embedded objects, and external non-hyperlink resources are rejected before LibreOffice. Each conversion uses an ephemeral LibreOffice profile and the job deadline.
 - When `CONVERTBOX_CLAMSCAN` is configured, uploads must pass ClamAV before entering the conversion queue. Detection rejects the upload; scanner errors and timeouts fail closed.
 - Uploads are streamed into mode `0600` UUID job directories (mode `0700`) under one normalized storage root.
 - Original names are metadata only. Server-generated paths are used for input and output; rename input is reduced to a safe basename.
@@ -96,7 +98,7 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
 - Downloads use `nosniff`, attachment disposition, and an opaque content type.
 - Optional shared-secret `X-API-Key` gate (`CONVERTBOX_API_KEY`) on the whole API and `/metrics`, compared in constant time; disabled by default since a lone-user local instance has no one else to authenticate.
 
-This reduces risk; it does not make arbitrary hostile document processing safe. Keep conversion workers isolated from credentials and internal networks. For a public multi-tenant service, split API and workers into separate containers/VMs and add malware scanning, rate limits, quotas, and abuse controls.
+This reduces risk; it does not make arbitrary hostile document processing safe. Keep conversion workers isolated from credentials and sensitive internal networks. The bundled worker is resource-limited but still shares a Redis network; a public multi-tenant service should give document conversion a dedicated, egress-denied sandbox/container and add malware scanning, rate limits, quotas, and abuse controls.
 
 The Redis recovery model currently assumes one worker service (which may run several configured worker goroutines). Do not scale the worker service to multiple replicas until per-worker leases and stale-claim recovery are implemented.
 

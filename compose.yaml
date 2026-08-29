@@ -67,10 +67,12 @@ services:
     volumes:
       - jobs:/data
     cpus: 1.0
-    mem_limit: 256m
-    pids_limit: 64
+    mem_limit: 768m
+    pids_limit: 128
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     environment:
       CONVERTBOX_MODE: "worker"
       CONVERTBOX_STORAGE: "/data"

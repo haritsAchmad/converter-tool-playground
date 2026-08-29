@@ -1,13 +1,16 @@
 package app
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -69,6 +72,10 @@ func validateUpload(path, original string) (string, error) {
 		if !bytes.HasPrefix(head, []byte("%PDF-")) {
 			return "", errors.New("extension and PDF signature do not match")
 		}
+	case "docx", "xlsx", "pptx":
+		if len(head) < 4 || !bytes.Equal(head[:4], []byte{'P', 'K', 0x03, 0x04}) {
+			return "", errors.New("extension and OOXML ZIP signature do not match")
+		}
 	default:
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
 			return "", errors.New("text input must be valid UTF-8 without NUL bytes")
@@ -113,6 +120,9 @@ func rejectActiveContent(path string) error {
 }
 
 func validateSyntax(format, path string) error {
+	if officeFormats[format] {
+		return validateOOXML(format, path)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -144,6 +154,82 @@ func validateSyntax(format, path string) error {
 	}
 	return nil
 }
+
+const (
+	maxOOXMLEntries          = 10000
+	maxOOXMLUncompressedSize = 200 << 20
+)
+
+func validateOOXML(format, path string) error {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return errors.New("invalid OOXML ZIP structure")
+	}
+	defer zr.Close()
+	if len(zr.File) == 0 || len(zr.File) > maxOOXMLEntries {
+		return errors.New("OOXML package has an unsafe number of entries")
+	}
+	requiredRoot := map[string]string{"docx": "word/document.xml", "xlsx": "xl/workbook.xml", "pptx": "ppt/presentation.xml"}[format]
+	foundTypes, foundRoot := false, false
+	var total uint64
+	for _, f := range zr.File {
+		name := strings.ReplaceAll(f.Name, "\\", "/")
+		clean := filepath.ToSlash(filepath.Clean(name))
+		if name == "" || strings.HasPrefix(name, "/") || filepath.VolumeName(clean) != "" || clean == ".." || strings.HasPrefix(clean, "../") {
+			return errors.New("OOXML package contains an unsafe path")
+		}
+		total += f.UncompressedSize64
+		zeroSizeMismatch := f.CompressedSize64 == 0 && f.UncompressedSize64 != 0
+		if total > maxOOXMLUncompressedSize || zeroSizeMismatch || (f.CompressedSize64 > 0 && f.UncompressedSize64/f.CompressedSize64 > 200) {
+			return errors.New("OOXML package exceeds decompression safety limits")
+		}
+		lower := strings.ToLower(clean)
+		if strings.Contains(lower, "vba") || strings.Contains(lower, "/activex/") || strings.Contains(lower, "/embeddings/") {
+			return errors.New("OOXML macros and embedded objects are not accepted")
+		}
+		if strings.HasSuffix(lower, ".rels") {
+			if err := validateOOXMLRelationships(f); err != nil {
+				return err
+			}
+		}
+		if clean == "[Content_Types].xml" {
+			foundTypes = true
+		}
+		if clean == requiredRoot {
+			foundRoot = true
+		}
+	}
+	if !foundTypes || !foundRoot {
+		return errors.New("OOXML package is missing required document parts")
+	}
+	return nil
+}
+
+func validateOOXMLRelationships(f *zip.File) error {
+	if f.UncompressedSize64 > 1<<20 {
+		return errors.New("OOXML relationship part is too large")
+	}
+	r, err := f.Open()
+	if err != nil {
+		return errors.New("invalid OOXML relationship part")
+	}
+	defer r.Close()
+	var relationships struct {
+		Items []struct {
+			Type       string `xml:"Type,attr"`
+			TargetMode string `xml:"TargetMode,attr"`
+		} `xml:"Relationship"`
+	}
+	if err := xml.NewDecoder(io.LimitReader(r, 1<<20)).Decode(&relationships); err != nil {
+		return errors.New("invalid OOXML relationship XML")
+	}
+	for _, rel := range relationships.Items {
+		if strings.EqualFold(rel.TargetMode, "External") && !strings.HasSuffix(strings.ToLower(rel.Type), "/hyperlink") {
+			return errors.New("OOXML external resources are not accepted")
+		}
+	}
+	return nil
+}
 func looksExecutable(b []byte) bool {
 	return bytes.HasPrefix(b, []byte("MZ")) || bytes.HasPrefix(b, []byte{0x7f, 'E', 'L', 'F'}) || bytes.HasPrefix(b, []byte("#!")) || bytes.HasPrefix(b, []byte{0xca, 0xfe, 0xba, 0xbe})
 }
@@ -160,6 +246,10 @@ func mimeAllowed(format, mime string) bool {
 	}
 	if format == "pdf" {
 		return mime == "application/pdf"
+	}
+	if officeFormats[format] {
+		return mime == "application/zip" || mime == "application/octet-stream" ||
+			strings.HasPrefix(mime, "application/vnd.openxmlformats-officedocument.")
 	}
 	return strings.HasPrefix(mime, "text/") || mime == "application/json" || mime == "application/xml" || mime == "application/octet-stream"
 }
