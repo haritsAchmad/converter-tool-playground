@@ -168,19 +168,24 @@ func validateSyntax(format, path string) error {
 		// pure Go) before the file ever reaches the native pdftoppm
 		// renderer: a PDF crafted to exploit one specific parser's bug is
 		// much less likely to also cleanly validate against a different one.
-		if err := api.Validate(bytes.NewReader(b), model.NewDefaultConfiguration()); err != nil {
+		// ReadAndValidate (rather than the plain Validate this used to
+		// call) does the same validation pass but also hands back the
+		// parsed *model.Context, which the page-count bound and the
+		// content-disarm check below both need--avoiding a second and
+		// third full re-parse of the same bytes.
+		ctx, err := api.ReadAndValidate(bytes.NewReader(b), model.NewDefaultConfiguration())
+		if err != nil {
 			return fmt.Errorf("invalid PDF structure: %w", err)
 		}
 		// Bounded up front, before rendering: convertPDF renders every page
 		// into its own file and zips them, so an unbounded page count is an
 		// unbounded amount of disk and pdftoppm wall time, not just a bigger
 		// single image.
-		count, err := api.PageCount(bytes.NewReader(b), model.NewDefaultConfiguration())
-		if err != nil {
-			return fmt.Errorf("could not determine PDF page count: %w", err)
+		if ctx.PageCount > maxPDFPages {
+			return fmt.Errorf("PDF has %d pages, exceeding the %d page rendering limit", ctx.PageCount, maxPDFPages)
 		}
-		if count > maxPDFPages {
-			return fmt.Errorf("PDF has %d pages, exceeding the %d page rendering limit", count, maxPDFPages)
+		if err := validatePDFActiveContent(ctx); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -207,6 +212,45 @@ const (
 	// worst case to 300 rendered files zipped into one output.
 	maxPDFPages = 300
 )
+
+// validatePDFActiveContent rejects a PDF carrying a mechanism that runs
+// code or exfiltrates data automatically the moment a document-processing
+// tool opens it, without needing any user interaction: an embedded
+// JavaScript name tree, an embedded file attachment, or a document-level
+// /OpenAction or /AA (additional actions) entry on the catalog. This is a
+// best-effort, document-level pass, not an exhaustive one—matching this
+// codebase's existing honesty about narrower-than-ideal reject-lists (see
+// e.g. rejectActiveContent's "<?php"/"<?=" pair): it deliberately does not
+// walk every page/annotation/form-field looking for a per-object action
+// dict (a Link annotation's own /A, or a form field's own /AA), since
+// those generally only fire on explicit user interaction (clicking a
+// link, editing a field) that this service's pdftoppm-based rendering
+// pipeline never performs. Verified against pdfcpu's own validation
+// source (pkg/pdfcpu/validate/xReftable.go's validateNames, which is what
+// populates XRefTable.Names["JavaScript"]/["EmbeddedFiles"] during
+// Validate/ReadAndValidate) rather than guessed.
+func validatePDFActiveContent(ctx *model.Context) error {
+	if ctx.Names["JavaScript"] != nil {
+		return errors.New("PDF contains embedded JavaScript, which is not accepted")
+	}
+	if ctx.Names["EmbeddedFiles"] != nil {
+		return errors.New("PDF contains an embedded file attachment, which is not accepted")
+	}
+	attachments, err := ctx.ListAttachments()
+	if err != nil {
+		return fmt.Errorf("could not check PDF for embedded file attachments: %w", err)
+	}
+	if len(attachments) > 0 {
+		return errors.New("PDF contains an embedded file attachment, which is not accepted")
+	}
+	if ctx.RootDict.HasEntry("OpenAction") {
+		return errors.New("PDF contains a document open action, which is not accepted")
+	}
+	if ctx.RootDict.HasEntry("AA") {
+		return errors.New("PDF document-level additional actions are not accepted")
+	}
+	return nil
+}
 
 // odfMimeType is the exact, required value of an ODF package's mandatory
 // first "mimetype" entry for each ODF format this codebase accepts. Used
