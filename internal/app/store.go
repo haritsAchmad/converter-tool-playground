@@ -15,6 +15,37 @@ import (
 
 const jobStateFile = "job.json"
 
+// readJobState reads a job's job.json sidecar, retrying briefly on an error
+// that isn't "the file doesn't exist". persist() writes via a temp file
+// plus os.Rename, which is atomic on POSIX but can transiently fail a
+// concurrent reader on Windows with a sharing violation while another
+// process (antivirus, search indexing) has briefly opened the file being
+// replaced—not a real "job not found", and without a retry it would wrongly
+// 404 a live job's status/download mid-request. A genuinely missing file
+// (wrong ID, already expired and removed) still fails immediately instead
+// of paying the retry cost.
+func readJobState(path string) ([]byte, error) {
+	return readWithRetry(func() ([]byte, error) { return os.ReadFile(path) })
+}
+
+// readWithRetry runs read up to 3 times with a short delay between
+// attempts, stopping as soon as it succeeds or fails with "not exist".
+// Factored out of readJobState so the retry/backoff logic itself can be
+// tested deterministically against a fake read function instead of trying
+// to reproduce a real, OS-specific transient file error.
+func readWithRetry(read func() ([]byte, error)) ([]byte, error) {
+	var data []byte
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		data, err = read()
+		if err == nil || os.IsNotExist(err) {
+			return data, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return data, err
+}
+
 type store struct {
 	root string
 	mu   sync.RWMutex
@@ -84,7 +115,7 @@ func (s *store) recover(now time.Time, log *slog.Logger, failQueued, failProcess
 			continue
 		}
 		dir := filepath.Join(s.root, entry.Name())
-		data, err := os.ReadFile(filepath.Join(dir, jobStateFile))
+		data, err := readJobState(filepath.Join(dir, jobStateFile))
 		if err != nil {
 			continue
 		}
@@ -129,7 +160,7 @@ func (s *store) reload(id string) (*Job, bool) {
 	existing := s.jobs[id]
 	s.mu.RUnlock()
 	dir := filepath.Join(s.root, id)
-	data, err := os.ReadFile(filepath.Join(dir, jobStateFile))
+	data, err := readJobState(filepath.Join(dir, jobStateFile))
 	if err != nil {
 		return nil, false
 	}
