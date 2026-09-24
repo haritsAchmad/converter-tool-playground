@@ -81,6 +81,16 @@ func TestValidateSVGAcceptsLocalFragmentAndSafeDataURI(t *testing.T) {
 	}{
 		{"local fragment use", `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"><defs><rect id="r" width="1" height="1"/></defs><use xlink:href="#r"/></svg>`},
 		{"safe data URI on an anchor", `<svg xmlns="http://www.w3.org/2000/svg"><a href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="><rect width="1" height="1"/></a></svg>`},
+		// temuan review P2: style="fill:url(#g)" referencing a local
+		// gradient/pattern definition is completely ordinary, standard SVG
+		// (not an edge case), and used to be wrongly rejected because
+		// validateSVG originally reused validateHTMLForPDF's data:-only CSS
+		// policy instead of its own (validateCSSForSVG), which accepts a
+		// local "#fragment" the same way isSafeSVGHref already does for a
+		// bare href.
+		{"local gradient referenced from a style attribute", `<svg xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g"><stop offset="0" stop-color="red"/><stop offset="1" stop-color="blue"/></linearGradient></defs><rect width="10" height="10" style="fill:url(#g)"/></svg>`},
+		{"local clip-path referenced from a style attribute", `<svg xmlns="http://www.w3.org/2000/svg"><defs><clipPath id="c"><rect width="5" height="5"/></clipPath></defs><rect width="10" height="10" style="clip-path:url(#c)"/></svg>`},
+		{"local gradient referenced from a <style> block", `<svg xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="g"><stop offset="0" stop-color="red"/></linearGradient></defs><style>.g { fill: url(#g); }</style><rect class="g" width="10" height="10"/></svg>`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -222,6 +232,32 @@ func TestConvertSVGRejectsOversizedCanvas(t *testing.T) {
 	err := convertSVG("png", inPath, filepath.Join(dir, "out.png"))
 	if err == nil {
 		t.Fatal("expected an oversized SVG canvas to be rejected")
+	}
+}
+
+// TestConvertSVGRejectsOverflowingViewBoxWithoutPanicking is the exact
+// reproduction from a code review finding (temuan review P1): a viewBox
+// large enough that int64(w)*int64(h) wraps around to a small value
+// (2^32 * 2^32 == 2^64 == 0 mod 2^64) used to sail straight past the
+// pixel-budget check, and image.NewRGBA then panicked on the actual
+// huge declared dimensions—an unrecovered panic in a worker goroutine
+// (no recover() wraps converter.run's call chain the way the HTTP
+// handlers' recoverer middleware does) which crashes the whole worker
+// process, not just fails the one job. Before the fix, this test
+// panicked instead of returning an error; convertSVG now bounds each
+// declared dimension individually before ever converting to int or
+// multiplying, so the oversized viewBox is rejected the same ordinary
+// way TestConvertSVGRejectsOversizedCanvas's more modest one is.
+func TestConvertSVGRejectsOverflowingViewBoxWithoutPanicking(t *testing.T) {
+	svg := `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 4294967296 4294967296"><rect width="1" height="1"/></svg>`
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.svg")
+	if err := os.WriteFile(inPath, []byte(svg), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := convertSVG("png", inPath, filepath.Join(dir, "out.png"))
+	if err == nil {
+		t.Fatal("expected an overflow-triggering viewBox to be rejected")
 	}
 }
 

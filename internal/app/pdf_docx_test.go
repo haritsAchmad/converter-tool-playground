@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -281,7 +282,7 @@ func TestPDFToDocxRejectsWhenNoTextFound(t *testing.T) {
 func TestWriteDocxEscapesSpecialCharacters(t *testing.T) {
 	outPath := filepath.Join(t.TempDir(), "out.docx")
 	pages := []string{"Tom & Jerry <tag> \"quoted\" café\nsecond line\n\nafter a blank line"}
-	if err := writeDocx(outPath, pages); err != nil {
+	if err := writeDocx(context.Background(), outPath, pages); err != nil {
 		t.Fatalf("writeDocx failed: %v", err)
 	}
 	tokens := parseDocx(t, outPath)
@@ -362,5 +363,71 @@ func TestPDFToDocxJobFlowsThroughWorker(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected the extracted text in the downloaded DOCX, got tokens: %v", tokens)
+	}
+}
+
+// TestWriteDocxChecksContextAfterWriting proves the ctx check after the
+// zip finalizes (see writeDocx) actually runs and is honored, mirroring
+// TestZipRenderedPagesChecksContextAfterFinalization for the identical
+// reason: writeDocx always writes the file regardless (there's no
+// meaningful partial state worth abandoning for something this small),
+// so a pre-cancelled context can only ever surface via that trailing
+// check.
+func TestWriteDocxChecksContextAfterWriting(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	outPath := filepath.Join(dir, "out.docx")
+	err := writeDocx(ctx, outPath, []string{"hello"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from the post-write check, got %v", err)
+	}
+	if _, statErr := os.Stat(outPath); statErr != nil {
+		t.Fatalf("expected the file to still be written despite the trailing cancellation, got: %v", statErr)
+	}
+}
+
+// countingCancelContext reports "not yet cancelled" for its first n
+// calls to Err(), then "cancelled" for every call after that—used to
+// deterministically place a cancellation exactly after a specific
+// number of ctx checks inside convertPDFToDocx, instead of racing a
+// real timer against real (and very fast) PDF text extraction.
+type countingCancelContext struct {
+	context.Context
+	n    int
+	seen int
+}
+
+func (c *countingCancelContext) Err() error {
+	c.seen++
+	if c.seen > c.n {
+		return context.Canceled
+	}
+	return nil
+}
+
+// TestConvertPDFToDocxChecksContextAfterLastPage proves the ctx check
+// added right after the page-extraction loop (see convertPDFToDocx)
+// actually runs and is honored. A single-page PDF makes the loop call
+// ctx.Err() exactly once, before extracting that one page; the
+// countingCancelContext is set to let exactly that one call through
+// cleanly and report cancellation on the next call—which, without the
+// trailing check this test targets, would never happen, and the job
+// would go on to write the DOCX and report success despite the
+// cancellation (temuan review P2: this is exactly what was observed
+// with a real already-expired deadline before the fix—the extraction
+// and write both complete regardless, and only a check placed after
+// they're done can ever catch it).
+func TestConvertPDFToDocxChecksContextAfterLastPage(t *testing.T) {
+	dir := t.TempDir()
+	inPath := filepath.Join(dir, "in.pdf")
+	if err := os.WriteFile(inPath, buildTextPDF([]string{"Hello Page One"}), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := &countingCancelContext{Context: context.Background(), n: 1}
+	outPath := filepath.Join(dir, "out.docx")
+	err := convertPDFToDocx(ctx, inPath, outPath)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from the post-loop check, got %v", err)
 	}
 }

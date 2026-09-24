@@ -791,7 +791,19 @@ func convertPDFToDocx(ctx context.Context, inPath, outPath string) (err error) {
 	if !nonBlank {
 		return errors.New("no extractable text found in this PDF (image-only pages or an unsupported font encoding)")
 	}
-	return writeDocx(outPath, pages)
+	// A per-page check runs at the TOP of each loop iteration above, so
+	// cancellation arriving during or right after the LAST page's own
+	// extraction (or while nothing but that final iteration was left
+	// running) was never actually observed before this call—the job
+	// would go on to finish writeDocx and report success regardless
+	// (temuan review P2: reproduced directly with an already-expired
+	// deadline reaching this point). Checked again, mirroring the same
+	// two-checks-around-one-loop shape convertPDF's own zipRenderedPages
+	// already uses for the identical reason.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return writeDocx(ctx, outPath, pages)
 }
 
 // docxPageSizeTwips is the US Letter page size (8.5in x 11in, in
@@ -816,7 +828,14 @@ const docxPageSizeTwips = `<w:pgSz w:w="12240" w:h="15840"/>`
 // explicit page break before the next page's content, so page
 // boundaries from the source PDF survive into the output even though
 // nothing else about its layout does.
-func writeDocx(outPath string, pages []string) error {
+//
+// ctx is checked once more after the write finishes, returned instead
+// of a bare nil—mirroring zipRenderedPages' own post-finalization check
+// for the identical reason: the write itself still runs to completion
+// either way (there's no partial/interruptible state worth abandoning
+// mid-write for a file this small), but a cancellation that arrived
+// during it must still be reported rather than papered over as success.
+func writeDocx(ctx context.Context, outPath string, pages []string) error {
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -860,7 +879,7 @@ func writeDocx(outPath string, pages []string) error {
 	if err := zw.Close(); err != nil {
 		return err
 	}
-	return nil
+	return ctx.Err()
 }
 
 func writeZipEntry(zw *zip.Writer, name string, data []byte) error {
@@ -995,10 +1014,26 @@ func convertSVG(out, inPath, outPath string) error {
 	if err != nil {
 		return fmt.Errorf("could not parse SVG: %w", err)
 	}
-	w, h := int(icon.ViewBox.W), int(icon.ViewBox.H)
-	if w <= 0 || h <= 0 {
-		w, h = defaultSVGCanvasSize, defaultSVGCanvasSize
-	} else {
+	// Validated as float64 BEFORE ever converting to int or multiplying:
+	// converting an out-of-range float to int is implementation-defined
+	// per the Go spec (not guaranteed to panic or clamp), and even a
+	// clean int64(w)*int64(h) can silently wrap past this codebase's own
+	// pixel-budget check for a large enough pair (temuan review P1:
+	// viewBox="0 0 4294967296 4294967296" makes int64(w)*int64(h) wrap to
+	// exactly 0 mod 2^64, sailing past the check below before it panics
+	// image.NewRGBA on the actual huge dimensions—confirmed by
+	// reproducing the panic directly). Bounding each declared dimension
+	// individually by maxImageDecodedPixels first guarantees w and h are
+	// both small enough (<=1e8) that int64(w)*int64(h) below (<=1e16)
+	// can never overflow int64 (max ~9.2e18) regardless of aspect ratio.
+	vw, vh := icon.ViewBox.W, icon.ViewBox.H
+	declared := vw > 0 && vh > 0
+	if declared && (vw > maxImageDecodedPixels || vh > maxImageDecodedPixels) {
+		return errors.New("SVG canvas dimensions exceed the safety limit")
+	}
+	w, h := defaultSVGCanvasSize, defaultSVGCanvasSize
+	if declared {
+		w, h = int(vw), int(vh)
 		icon.SetTarget(0, 0, float64(w), float64(h))
 	}
 	// Same decompression-bomb-shaped ceiling as an ordinary PNG/JPEG
@@ -1006,7 +1041,11 @@ func convertSVG(out, inPath, outPath string) error {
 	// can declare an arbitrarily large viewBox just as freely as a PNG
 	// header can lie about its dimensions, and the raster canvas below is
 	// allocated eagerly at this size regardless of how little the SVG
-	// actually draws into it.
+	// actually draws into it. w and h are both already bounded to
+	// [1, 1e8] by the per-dimension check above, so this product cannot
+	// overflow; it only rejects a jointly-oversized-but-individually-
+	// reasonable pair (e.g. 20000x20000) the per-dimension check alone
+	// wouldn't catch.
 	if int64(w)*int64(h) > maxImageDecodedPixels {
 		return errors.New("SVG canvas dimensions exceed the safety limit")
 	}

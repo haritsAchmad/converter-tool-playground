@@ -931,6 +931,29 @@ func isSafeSVGHref(val string) bool {
 	return val == "" || strings.HasPrefix(val, "#") || isSafeDataURI(val)
 }
 
+// validateCSSForSVG is validateSVG's own CSS policy (a style="" attribute
+// or a <style> element's text content), separate from validateCSSForPDF:
+// reusing that HTML/PDF-specific check here rejected a completely
+// ordinary, safe SVG construct—style="fill:url(#g)" referencing a
+// <linearGradient id="g"> defined earlier in the very same document—
+// since validateCSSForPDF's url() policy (isSafeResourceRef) only ever
+// accepts an inline data: URI, never a local "#fragment" (temuan review
+// P2: reproduced directly, a plain local-gradient style attribute came
+// back rejected with an HTML-flavored error message from a codepath
+// that has nothing to do with HTML). SVG legitimately references its
+// own <linearGradient>/<radialGradient>/<pattern>/<clipPath>/<mask>
+// definitions this way constantly—it's the standard mechanism, not an
+// edge case—so this reuses isSafeSVGHref's policy (empty, a local
+// "#fragment", or a safe data: URI) instead of isSafeResourceRef's.
+func validateCSSForSVG(css string) error {
+	for _, m := range cssURLPattern.FindAllStringSubmatch(css, -1) {
+		if !isSafeSVGHref(m[1]) {
+			return errors.New("SVG contains a CSS url() reference to something other than a local #fragment or an inline data: URI, which is not accepted")
+		}
+	}
+	return nil
+}
+
 // validateSVG is the "dedicated sanitizer" half of the roadmap's "SVG
 // only after a dedicated sanitizer and rasterization boundary"
 // requirement (the rasterization-boundary half is convertSVG). It parses
@@ -944,11 +967,14 @@ func isSafeSVGHref(val string) bool {
 // that isn't <svg>, any element in dangerousSVGTags, any inline
 // event-handler attribute (onload=, onclick=, ...), any javascript: URI
 // in any attribute, any href/xlink:href that isn't a same-document
-// "#fragment" reference or a safe inline data: image URI
-// (isSafeResourceRef, shared with validateHTMLForPDF), and any CSS
-// (style attribute or <style> element content) carrying a url() to
-// anything but a safe data: URI (validateCSSForPDF, also shared). A
-// leading DOCTYPE is rejected outright too: a real SVG has no legitimate
+// "#fragment" reference or a safe inline data: image URI (isSafeSVGHref),
+// and any CSS (style attribute or <style> element content) carrying a
+// url() to anything but a local "#fragment" or a safe data: URI
+// (validateCSSForSVG—deliberately its own policy, not validateHTMLForPDF's
+// data:-only validateCSSForPDF, since an SVG routinely references its own
+// <linearGradient>/<pattern>/<clipPath> definitions via style="fill:url(#g)",
+// a normal construct that policy would wrongly reject). A leading DOCTYPE
+// is rejected outright too: a real SVG has no legitimate
 // use for one, and Go's decoder already can't be tricked by what a
 // DOCTYPE would normally declare, so this only ever rejects something
 // with no benign purpose here (mirrors validateHTMLForPDF's own
@@ -1008,7 +1034,7 @@ func validateSVG(path string) error {
 					return errors.New("SVG contains a href/xlink:href reference to something other than a local #fragment or an inline data: URI, which is not accepted")
 				}
 				if name == "style" {
-					if err := validateCSSForPDF(a.Value); err != nil {
+					if err := validateCSSForSVG(a.Value); err != nil {
 						return err
 					}
 				}
@@ -1019,7 +1045,7 @@ func validateSVG(path string) error {
 			}
 		case xml.CharData:
 			if inStyle {
-				if err := validateCSSForPDF(string(t)); err != nil {
+				if err := validateCSSForSVG(string(t)); err != nil {
 					return err
 				}
 			}
