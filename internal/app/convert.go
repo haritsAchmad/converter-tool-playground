@@ -25,6 +25,7 @@ import (
 	"strings"
 
 	md "github.com/JohannesKaufmann/html-to-markdown/v2"
+	"github.com/ledongthuc/pdf"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
@@ -123,6 +124,29 @@ var odfFormats = map[string]bool{"odt": true, "ods": true, "odp": true}
 // of a pure-Go rasterization boundary.
 var svgOutputFormats = map[string]bool{"png": true, "jpeg": true}
 
+// pdfTextExtractionFormats are the "Experimental PDF -> Office
+// extraction" roadmap item's actual, deliberately narrow scope: PDF ->
+// DOCX only, plain text only, one paragraph per line and a page break
+// between each PDF page—explicitly NOT layout-preserving (no attempt
+// at columns, tables, fonts, or image placement), matching the
+// roadmap's own warning not to advertise this as layout-perfect. Text
+// is pulled per page with github.com/ledongthuc/pdf's GetPlainText,
+// chosen after confirming pdfcpu (already a dependency here) has no
+// plain-text extraction API of its own—only raw content-stream/image/
+// font/page extraction, which would need a hand-written PDF
+// content-stream interpreter (font encoding, CMaps, text positioning)
+// to turn into readable text, a much larger and easier-to-get-subtly-
+// wrong undertaking than reusing a maintained, focused library for
+// it. Verified before depending on it: pure Go, BSD-3-Clause, no
+// net/net-http/os-exec import anywhere in the package (checked
+// directly against its source, the same bar oksvg/rasterx were held
+// to), no govulncheck advisories, and its own GetPlainText already
+// recovers internally from a parse panic into a returned error rather
+// than crashing the process—convertPDFToDocx adds its own outer
+// recover too, since that guarantee doesn't necessarily extend to
+// every call this codebase makes into the package (Open/NumPage/Page).
+var pdfTextExtractionFormats = map[string]bool{"docx": true}
+
 func newConverter() *converter {
 	magick, _ := exec.LookPath("magick")
 	pdftoppm, _ := exec.LookPath("pdftoppm")
@@ -187,6 +211,13 @@ func (c *converter) supports(in, out string) bool {
 	if in == "svg" && svgOutputFormats[out] {
 		// Pure Go via oksvg/rasterx—no external tool required, so always
 		// available, same as the imageFormats->pdf pair above.
+		return true
+	}
+	if in == "pdf" && pdfTextExtractionFormats[out] {
+		// Pure Go via github.com/ledongthuc/pdf plus a hand-written
+		// minimal DOCX writer—no external tool required, so always
+		// available. Experimental text-only extraction, not a
+		// layout-preserving conversion—see pdfTextExtractionFormats.
 		return true
 	}
 	if imageFormats[in] && imageFormats[out] {
@@ -256,6 +287,9 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 	}
 	if dataFormats[in] {
 		return convertData(in, out, inPath, outPath)
+	}
+	if in == "pdf" && pdfTextExtractionFormats[out] {
+		return convertPDFToDocx(ctx, inPath, outPath)
 	}
 	if in == "pdf" {
 		return c.convertPDF(ctx, out, inPath, outPath)
@@ -691,6 +725,151 @@ func (cr contextReader) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	return cr.r.Read(p)
+}
+
+// maxPDFExtractedTextBytes bounds the total plain text convertPDFToDocx
+// will accumulate across every page before writing it out. Unlike
+// convertPDF's image rendering, where output size scales predictably
+// with page count and a fixed DPI, extracted text size has no such
+// natural relationship to the source PDF's byte size—a pathological
+// content stream could in principle decode to far more text bytes than
+// the file itself—so this caps it directly rather than only relying on
+// the existing maxPDFPages page-count bound.
+const maxPDFExtractedTextBytes = 20 << 20
+
+// convertPDFToDocx is the "Experimental PDF -> Office extraction"
+// roadmap item, scoped to exactly what pdfTextExtractionFormats' doc
+// comment describes: plain text only, one DOCX paragraph per extracted
+// line, a page break between each source PDF page, nothing else. A
+// page ledongthuc/pdf can't extract text from (an unusual font
+// encoding, or a scanned/image-only page with no text layer at all)
+// contributes an empty page rather than failing the whole job—but if
+// literally nothing came back non-blank across every page, the job
+// fails outright with a clear reason instead of silently producing a
+// DOCX with nothing useful in it.
+func convertPDFToDocx(ctx context.Context, inPath, outPath string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("PDF text extraction panicked: %v", r)
+		}
+	}()
+	f, r, err := pdf.Open(inPath)
+	if err != nil {
+		return fmt.Errorf("could not open PDF for text extraction: %w", err)
+	}
+	defer f.Close()
+	numPages := r.NumPage()
+	if numPages <= 0 {
+		return errors.New("PDF has no pages to extract text from")
+	}
+	if numPages > maxPDFPages {
+		// Already enforced at upload validation (validateSyntax's PDF
+		// case); repeated here as defense in depth against a job that
+		// somehow reaches conversion without having gone through it.
+		numPages = maxPDFPages
+	}
+	pages := make([]string, numPages)
+	total := 0
+	nonBlank := false
+	for i := 1; i <= numPages; i++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		text, extractErr := r.Page(i).GetPlainText(nil)
+		if extractErr != nil {
+			continue // best-effort: leave this one page blank, don't fail the job
+		}
+		total += len(text)
+		if total > maxPDFExtractedTextBytes {
+			return errors.New("extracted text exceeds the safety limit")
+		}
+		if strings.TrimSpace(text) != "" {
+			nonBlank = true
+		}
+		pages[i-1] = text
+	}
+	if !nonBlank {
+		return errors.New("no extractable text found in this PDF (image-only pages or an unsupported font encoding)")
+	}
+	return writeDocx(outPath, pages)
+}
+
+// docxPageSizeTwips is the US Letter page size (8.5in x 11in, in
+// twentieths of a point—the unit WordprocessingML's w:pgSz uses), the
+// single most common default in a real Word-authored document, per
+// ECMA-376. writeDocx's output carries no layout information of its own
+// (see pdfTextExtractionFormats' doc comment), so this is only here
+// because most DOCX consumers expect a w:sectPr with a page size to be
+// present at all, not because it means anything about the source PDF's
+// own page size.
+const docxPageSizeTwips = `<w:pgSz w:w="12240" w:h="15840"/>`
+
+// writeDocx hand-builds a minimal, valid WordprocessingML (.docx)
+// package—this codebase otherwise only ever validates/reads OOXML
+// (validateOOXML), never writes it, so there's no existing writer to
+// reuse. The three parts below ([Content_Types].xml, _rels/.rels,
+// word/document.xml) are the documented minimum ECMA-376 requires for a
+// package to be recognized as a WordprocessingML document at all. Each
+// input page becomes one or more paragraphs (one per line, split on
+// "\n"; a blank line becomes an empty paragraph rather than being
+// dropped, preserving the source's blank-line spacing) followed by an
+// explicit page break before the next page's content, so page
+// boundaries from the source PDF survive into the output even though
+// nothing else about its layout does.
+func writeDocx(outPath string, pages []string) error {
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	zw := zip.NewWriter(f)
+
+	if err := writeZipEntry(zw, "[Content_Types].xml", []byte(xml.Header+`<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`)); err != nil {
+		_ = zw.Close()
+		return err
+	}
+	if err := writeZipEntry(zw, "_rels/.rels", []byte(xml.Header+`<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>`)); err != nil {
+		_ = zw.Close()
+		return err
+	}
+
+	var body bytes.Buffer
+	for i, page := range pages {
+		if i > 0 {
+			body.WriteString(`<w:p><w:r><w:br w:type="page"/></w:r></w:p>`)
+		}
+		for _, line := range strings.Split(page, "\n") {
+			line = strings.TrimRight(line, "\r")
+			if line == "" {
+				body.WriteString(`<w:p/>`)
+				continue
+			}
+			body.WriteString(`<w:p><w:r><w:t xml:space="preserve">`)
+			_ = xml.EscapeText(&body, []byte(line))
+			body.WriteString(`</w:t></w:r></w:p>`)
+		}
+	}
+	document := xml.Header +
+		`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>` +
+		body.String() +
+		`<w:sectPr>` + docxPageSizeTwips + `</w:sectPr></w:body></w:document>`
+	if err := writeZipEntry(zw, "word/document.xml", []byte(document)); err != nil {
+		_ = zw.Close()
+		return err
+	}
+	if err := zw.Close(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func writeZipEntry(zw *zip.Writer, name string, data []byte) error {
+	w, err := zw.Create(name)
+	if err != nil {
+		return err
+	}
+	_, err = w.Write(data)
+	return err
 }
 
 func convertDocument(in, out, inPath, outPath string) error {

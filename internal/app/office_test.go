@@ -114,7 +114,7 @@ func TestOfficeCapabilitiesDependOnLibreOffice(t *testing.T) {
 			t.Fatalf("expected %s -> PDF support with LibreOffice", strings.ToUpper(format))
 		}
 	}
-	if c.supports("pdf", "docx") {
-		t.Fatal("PDF -> DOCX must not be advertised")
+	if !c.supports("pdf", "docx") {
+		t.Fatal("PDF -> DOCX (text extraction, pure Go) should be advertised regardless of LibreOffice")
 	}
 }
