@@ -3,6 +3,7 @@ package app
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -17,9 +18,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
@@ -89,6 +93,22 @@ func validateUpload(path, original string) (string, error) {
 		if !isODFMimetypeEntry(head, odfMimeType[candidate]) {
 			return "", errors.New("ODF mimetype entry is missing or does not match the declared format")
 		}
+	case "wav":
+		if len(head) < 12 || string(head[:4]) != "RIFF" || string(head[8:12]) != "WAVE" {
+			return "", errors.New("extension and WAV signature do not match")
+		}
+	case "flac":
+		if !bytes.HasPrefix(head, []byte("fLaC")) {
+			return "", errors.New("extension and FLAC signature do not match")
+		}
+	case "ogg":
+		if !bytes.HasPrefix(head, []byte("OggS")) {
+			return "", errors.New("extension and Ogg signature do not match")
+		}
+	case "mp3":
+		if !isMP3Signature(head) {
+			return "", errors.New("extension and MP3 signature do not match")
+		}
 	default:
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
 			return "", errors.New("text input must be valid UTF-8 without NUL bytes")
@@ -142,6 +162,9 @@ func validateSyntax(format, path string) error {
 	}
 	if odfFormats[format] {
 		return validateODF(format, path)
+	}
+	if audioFormats[format] {
+		return validateAudio(format, path)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -211,7 +234,138 @@ const (
 	// comfortably covers a thesis or report while bounding convertPDF's
 	// worst case to 300 rendered files zipped into one output.
 	maxPDFPages = 300
+	// Duration ceiling for audio input, checked against ffprobe's own
+	// reported format duration before conversion. 4 hours comfortably
+	// covers an audiobook or a long recording while bounding convertAudio's
+	// worst-case transcode time, which the job timeout alone only catches
+	// after a worker has already committed to running it.
+	maxAudioDurationSeconds = 4 * 60 * 60
+	// Wall-clock bound on the ffprobe call validateAudio makes at upload
+	// time, separate from (and much shorter than) the job timeout that
+	// bounds the actual conversion later—probing is supposed to be cheap
+	// relative to transcoding, and a file that makes ffprobe itself take
+	// this long is treated as suspect rather than waited out.
+	audioProbeTimeout = 10 * time.Second
 )
+
+// audioCodecWhitelist is the closed set of audio codecs accepted inside
+// each container audioFormats supports, keyed by ffprobe's own
+// codec_name. libmp3lame/libvorbis availability (needed to re-encode into
+// mp3/ogg) was confirmed against Alpine's ffmpeg package rather than
+// assumed—see audioOutputEncoder in convert.go. wav is restricted to the
+// common PCM variants rather than every codec WAV's format tag can
+// technically carry; ogg deliberately excludes theora (Ogg can carry
+// video) and anything else a container built for arbitrary codecs might
+// smuggle in.
+var audioCodecWhitelist = map[string]map[string]bool{
+	"mp3":  {"mp3": true},
+	"wav":  {"pcm_s16le": true, "pcm_s24le": true, "pcm_s32le": true, "pcm_u8": true, "pcm_f32le": true, "pcm_f64le": true},
+	"flac": {"flac": true},
+	"ogg":  {"vorbis": true, "opus": true, "flac": true},
+}
+
+// ffprobeOutput is the slice of ffprobe's own `-of json -show_streams
+// -show_format` output validateAudio actually needs; unrecognized fields
+// are ignored by encoding/json, so this doesn't have to mirror ffprobe's
+// full schema.
+type ffprobeOutput struct {
+	Streams []ffprobeStream `json:"streams"`
+	Format  ffprobeFormat   `json:"format"`
+}
+type ffprobeStream struct {
+	CodecName   string         `json:"codec_name"`
+	CodecType   string         `json:"codec_type"`
+	Disposition map[string]int `json:"disposition"`
+}
+type ffprobeFormat struct {
+	Duration string `json:"duration"`
+}
+
+// isMP3Signature reports whether head starts with either an ID3v2 tag
+// ("ID3", the common case for a real-world MP3 with metadata) or a raw
+// MPEG audio frame sync (11 set bits: 0xFF followed by a byte whose top 3
+// bits are also set). MP3 has no single universal magic number the way
+// FLAC ("fLaC") or Ogg ("OggS") do—verified against Go's own net/http
+// sniffer (sniff.go), which recognizes only the ID3-tagged form as
+// "audio/mpeg" and falls back to a generic binary type for the bare
+// frame-sync form, which is why mimeAllowed accepts both audio/mpeg and
+// application/octet-stream for mp3.
+func isMP3Signature(head []byte) bool {
+	if bytes.HasPrefix(head, []byte("ID3")) {
+		return true
+	}
+	return len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0
+}
+
+// validateAudio probes path with ffprobe (using the same hardening flags
+// as the real conversion—see audioProbeArgs in convert.go) and rejects it
+// unless validateAudioStreams accepts the result. Looks up ffprobe itself
+// rather than taking a *converter, so this free function (like every
+// other validateX in this file) doesn't need App-level wiring threaded
+// through validateUpload/validateSyntax just for this one format family.
+func validateAudio(format, path string) error {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return errors.New("audio validation is not available")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), audioProbeTimeout)
+	defer cancel()
+	args := append([]string{}, audioProbeArgs...)
+	args = append(args, "-f", format, "-i", path, "-show_streams", "-show_format", "-of", "json")
+	cmd := exec.CommandContext(ctx, ffprobe, args...)
+	cmd.Env = []string{"PATH=" + filepath.Dir(ffprobe)}
+	stdout, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("invalid audio structure: %w", err)
+	}
+	var probe ffprobeOutput
+	if err := json.Unmarshal(stdout, &probe); err != nil {
+		return fmt.Errorf("could not parse audio probe output: %w", err)
+	}
+	return validateAudioStreams(format, probe)
+}
+
+// validateAudioStreams is validateAudio's decision logic, factored out as
+// a pure function over an already-parsed probe result so it can be unit
+// tested against hand-written fixtures instead of needing a real ffprobe
+// binary. Accepts exactly one audio stream whose codec is on
+// audioCodecWhitelist for format, plus—since real-world MP3/FLAC/Ogg
+// files very commonly carry embedded cover art, which ffprobe reports as
+// a "video" stream—any number of attached-picture streams
+// (disposition.attached_pic == 1). Rejects anything else outright: a real
+// (non-attached-pic) video stream, a subtitle or data stream, more than
+// one audio stream, or a codec not on the whitelist. Also enforces
+// maxAudioDurationSeconds against the container's own reported duration.
+func validateAudioStreams(format string, probe ffprobeOutput) error {
+	allowed := audioCodecWhitelist[format]
+	audioStreams := 0
+	for _, s := range probe.Streams {
+		switch s.CodecType {
+		case "audio":
+			audioStreams++
+			if !allowed[s.CodecName] {
+				return fmt.Errorf("audio codec %q is not accepted for %s input", s.CodecName, format)
+			}
+		case "video":
+			if s.Disposition["attached_pic"] != 1 {
+				return errors.New("audio file contains a video stream, which is not accepted")
+			}
+		default:
+			return fmt.Errorf("audio file contains a %s stream, which is not accepted", s.CodecType)
+		}
+	}
+	if audioStreams != 1 {
+		return fmt.Errorf("expected exactly one audio stream, found %d", audioStreams)
+	}
+	duration, err := strconv.ParseFloat(probe.Format.Duration, 64)
+	if err != nil {
+		return errors.New("could not determine audio duration")
+	}
+	if duration <= 0 || duration > maxAudioDurationSeconds {
+		return fmt.Errorf("audio duration of %.0fs is invalid or exceeds the %ds limit", duration, maxAudioDurationSeconds)
+	}
+	return nil
+}
 
 // validatePDFActiveContent rejects a PDF carrying a mechanism that runs
 // code or exfiltrates data automatically the moment a document-processing
@@ -862,6 +1016,26 @@ func mimeAllowed(format, mime string) bool {
 		// type isODFMimetypeEntry already checked directly against the
 		// package's own mandatory mimetype entry.
 		return mime == "application/zip" || mime == "application/octet-stream" || mime == odfMimeType[format]
+	}
+	if audioFormats[format] {
+		// Verified against Go's own net/http sniffer (sniff.go): it
+		// recognizes an ID3-tagged mp3 as "audio/mpeg", RIFF/WAVE as
+		// "audio/wave", and "OggS\x00" as "application/ogg", but has no
+		// signature for FLAC at all (no "fLaC" entry in its table) and
+		// doesn't recognize a bare-frame-sync mp3 (no ID3 tag) either—both
+		// fall through to the generic "application/octet-stream", which is
+		// why every case here accepts that too rather than just the one
+		// "proper" MIME type.
+		switch format {
+		case "mp3":
+			return mime == "audio/mpeg" || mime == "application/octet-stream"
+		case "wav":
+			return mime == "audio/wave" || mime == "application/octet-stream"
+		case "flac":
+			return mime == "application/octet-stream"
+		case "ogg":
+			return mime == "application/ogg" || mime == "application/octet-stream"
+		}
 	}
 	return strings.HasPrefix(mime, "text/") || mime == "application/json" || mime == "application/xml" || mime == "application/octet-stream"
 }

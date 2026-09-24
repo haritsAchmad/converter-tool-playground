@@ -31,7 +31,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type converter struct{ magick, pdftoppm, libreoffice string }
+type converter struct{ magick, pdftoppm, libreoffice, ffmpeg, ffprobe string }
 
 var formats = map[string]Format{
 	"csv":      {"csv", "CSV", "Data", []string{".csv"}},
@@ -50,11 +50,23 @@ var formats = map[string]Format{
 	"odt":      {"odt", "OpenDocument Text (ODT)", "OpenDocument", []string{".odt"}},
 	"ods":      {"ods", "OpenDocument Spreadsheet (ODS)", "OpenDocument", []string{".ods"}},
 	"odp":      {"odp", "OpenDocument Presentation (ODP)", "OpenDocument", []string{".odp"}},
+	"mp3":      {"mp3", "MP3", "Audio", []string{".mp3"}},
+	"wav":      {"wav", "WAV", "Audio", []string{".wav"}},
+	"flac":     {"flac", "FLAC", "Audio", []string{".flac"}},
+	"ogg":      {"ogg", "Ogg (Vorbis/Opus)", "Audio", []string{".ogg"}},
 }
 
 var dataFormats = map[string]bool{"csv": true, "json": true, "xml": true, "yaml": true}
 var imageFormats = map[string]bool{"png": true, "jpeg": true, "webp": true}
 var officeFormats = map[string]bool{"docx": true, "xlsx": true, "pptx": true}
+
+// audioFormats are converted via ffmpeg/ffprobe (see convertAudio and
+// validateAudio). The format id doubles as the ffmpeg/ffprobe demuxer and
+// muxer short name for each (verified: "mp3", "wav", "flac", and "ogg" are
+// all real libavformat format names, not guessed), which is what lets
+// convertAudio force -f <id> on both the input and output side instead of
+// leaving format auto-detection to content sniffing.
+var audioFormats = map[string]bool{"mp3": true, "wav": true, "flac": true, "ogg": true}
 
 // odfFormats are ODF's own package family (odt/ods/odp), deliberately kept
 // separate from officeFormats: they go through the same convertOffice/
@@ -74,7 +86,9 @@ func newConverter() *converter {
 	if libreoffice == "" {
 		libreoffice, _ = exec.LookPath("soffice")
 	}
-	return &converter{magick: magick, pdftoppm: pdftoppm, libreoffice: libreoffice}
+	ffmpeg, _ := exec.LookPath("ffmpeg")
+	ffprobe, _ := exec.LookPath("ffprobe")
+	return &converter{magick: magick, pdftoppm: pdftoppm, libreoffice: libreoffice, ffmpeg: ffmpeg, ffprobe: ffprobe}
 }
 
 func (c *converter) capabilities() []publicFormat {
@@ -114,6 +128,9 @@ func (c *converter) supports(in, out string) bool {
 	}
 	if (in == "markdown" || in == "html") && out == "pdf" {
 		return c.libreoffice != ""
+	}
+	if audioFormats[in] && audioFormats[out] {
+		return c.ffmpeg != "" && c.ffprobe != ""
 	}
 	if imageFormats[in] && out == "pdf" {
 		// Pure Go via pdfcpu (already a dependency for PDF structural
@@ -211,6 +228,9 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 	}
 	if (in == "markdown" || in == "html") && out == "pdf" {
 		return c.convertMarkupToPDF(ctx, in, inPath, outPath)
+	}
+	if audioFormats[in] && audioFormats[out] {
+		return c.convertAudio(ctx, in, out, inPath, outPath)
 	}
 	return convertDocument(in, out, inPath, outPath)
 }
@@ -702,6 +722,75 @@ func convertImageToPDF(inPath, outPath string) error {
 		Height: float64(cfg.Height) * 72 / pdfImportDPI,
 	}
 	return api.ImportImagesFile([]string{inPath}, outPath, imp, model.NewDefaultConfiguration())
+}
+
+// audioOutputEncoder maps each accepted output container to the specific
+// codec (and a fixed quality/bitrate) ffmpeg encodes it with, rather than
+// leaving container->default-codec selection to ffmpeg itself, which can
+// vary by build. libmp3lame and libvorbis are both confirmed present in
+// Alpine's ffmpeg package (ffmpeg-libavcodec depends on libmp3lame.so.0
+// and libvorbis.so.0/libvorbisenc.so.2, the same package this project's
+// Dockerfile installs), not assumed bundled.
+var audioOutputEncoder = map[string][]string{
+	"mp3":  {"-c:a", "libmp3lame", "-b:a", "192k"},
+	"wav":  {"-c:a", "pcm_s16le"},
+	"flac": {"-c:a", "flac"},
+	"ogg":  {"-c:a", "libvorbis", "-q:a", "5"},
+}
+
+// audioProbeArgs are the hardening flags shared by every ffmpeg/ffprobe
+// invocation that touches a user-supplied audio file, whether probing it
+// (validateAudio) or actually transcoding it (convertAudio):
+//
+//   - "-protocol_whitelist file" keeps every protocol other than plain
+//     local file I/O out of reach, for both the direct input and anything
+//     a crafted container might reference internally. Verified against
+//     real-world SSRF/LFI writeups for ffmpeg's HLS/concat demuxers, which
+//     is exactly the class of attack this closes off: without it, a file
+//     merely named "*.mp3" but structured as an HLS playlist or concat
+//     script could make ffmpeg fetch an internal http(s) URL or read an
+//     arbitrary local file the worker process can see.
+//   - "-f <format>" (appended by each caller, not here, since it differs
+//     per call) forces the exact demuxer rather than leaving format
+//     selection to ffmpeg's own content-based auto-detection, so a file
+//     that doesn't actually parse as that format fails outright instead
+//     of ffmpeg falling back to guessing what it might be--including
+//     guessing "this is actually an HLS playlist", the same class of
+//     confusion the protocol whitelist alone doesn't fully close (a
+//     concat/HLS demuxer's own nested references are still resolved
+//     through whatever protocols are whitelisted).
+//   - "-analyzeduration"/"-probesize" bound how much of the file ffmppeg
+//     will read while determining stream parameters, pinned to explicit
+//     values rather than relying on ffmpeg's own version-dependent
+//     defaults (these have changed across ffmpeg releases).
+//   - "-nostdin" stops ffmpeg from ever waiting on interactive input, and
+//     "-v error" keeps its own diagnostic chatter out of stdout so
+//     validateAudio's JSON parse only ever sees ffprobe's actual output.
+var audioProbeArgs = []string{"-nostdin", "-v", "error", "-protocol_whitelist", "file", "-analyzeduration", "5000000", "-probesize", "5000000"}
+
+// convertAudio transcodes in (one of audioFormats) to out via ffmpeg,
+// mapping only the input's single validated audio stream (-map 0:a:0) and
+// explicitly dropping video/subtitle/data streams (-vn -sn -dn)--
+// including the attached-picture "video" stream validateAudio allows
+// through for cover art, which has no equivalent in most of these output
+// containers and would otherwise carry through unpredictably depending on
+// the target format.
+func (c *converter) convertAudio(ctx context.Context, in, out, inPath, outPath string) error {
+	if c.ffmpeg == "" {
+		return errors.New("audio conversion is not available")
+	}
+	args := append([]string{}, audioProbeArgs...)
+	args = append(args, "-f", in, "-i", inPath, "-map", "0:a:0", "-vn", "-sn", "-dn")
+	args = append(args, audioOutputEncoder[out]...)
+	args = append(args, "-f", out, outPath)
+	cmd := exec.CommandContext(ctx, c.ffmpeg, args...)
+	cmd.Dir = filepath.Dir(inPath)
+	cmd.Env = []string{"PATH=" + filepath.Dir(c.ffmpeg)}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("audio conversion failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 func convertData(in, out, inPath, outPath string) error {
