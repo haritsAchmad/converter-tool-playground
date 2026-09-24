@@ -298,6 +298,12 @@ func TestResolvePDFModeRejectsWhenNotApplicable(t *testing.T) {
 	if _, err := resolvePDFMode("png", "pdf", "optimized"); err == nil {
 		t.Fatal("expected pdfMode to be rejected for image->PDF (it only tunes the LibreOffice export filter)")
 	}
+	if _, err := resolvePDFMode("html", "pdf", "optimized"); err == nil {
+		t.Fatal("expected pdfMode to be rejected for html->PDF (it also goes through LibreOffice, but has no per-format filter options)")
+	}
+	if _, err := resolvePDFMode("markdown", "pdf", "optimized"); err == nil {
+		t.Fatal("expected pdfMode to be rejected for markdown->PDF")
+	}
 }
 
 func TestResolvePDFModeIsCaseInsensitiveAndTrimmed(t *testing.T) {

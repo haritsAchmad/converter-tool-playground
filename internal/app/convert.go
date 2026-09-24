@@ -95,6 +95,9 @@ func (c *converter) supports(in, out string) bool {
 	if officeFormats[in] && out == "pdf" {
 		return c.libreoffice != ""
 	}
+	if (in == "markdown" || in == "html") && out == "pdf" {
+		return c.libreoffice != ""
+	}
 	if imageFormats[in] && out == "pdf" {
 		// Pure Go via pdfcpu (already a dependency for PDF structural
 		// validation)—no external tool required, so always available.
@@ -179,6 +182,9 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 	}
 	if officeFormats[in] {
 		return c.convertOffice(ctx, in, pdfMode, inPath, outPath)
+	}
+	if (in == "markdown" || in == "html") && out == "pdf" {
+		return c.convertMarkupToPDF(ctx, in, inPath, outPath)
 	}
 	return convertDocument(in, out, inPath, outPath)
 }
@@ -278,15 +284,89 @@ func (c *converter) convertOffice(ctx context.Context, in, pdfMode, inPath, outP
 	if err := copyPrivateFile(inPath, staged); err != nil {
 		return err
 	}
+	convertTo := "pdf"
+	if opts := officePDFFilterOptions(in, pdfMode); opts != "" {
+		convertTo = "pdf:" + officePDFFilterName[in] + ":" + opts
+	}
+	return c.convertViaLibreOffice(ctx, workDir, staged, convertTo, outPath)
+}
+
+// convertMarkupToPDF renders Markdown or HTML to PDF via the same headless
+// LibreOffice engine and per-job profile isolation convertOffice uses for
+// Office documents. Markdown is rendered to HTML first with goldmark in its
+// default *safe* mode—raw HTML embedded in the Markdown source is dropped
+// from the output rather than passed through—rather than handed to
+// LibreOffice directly, since a bundled headless LibreOffice cannot be
+// relied on to have a Markdown import filter at all, let alone one that
+// renders CommonMark correctly; this reuses the exact rendering
+// convertDocument already does for markdown->html.
+//
+// Unlike the pure-Go HTML<->Markdown text conversion this codebase already
+// had, this path actually RENDERS the document with a real layout engine
+// that resolves references, so it goes through validateHTMLForPDF first:
+// <script>/<iframe>/inline-event-handler content and, just as importantly,
+// any external resource reference (an <img src="http://...">, a stylesheet
+// <link>, or a CSS url(...) pointing off-box) has to be rejected rather
+// than let LibreOffice fetch it during conversion—the same SSRF-shaped risk
+// already flagged for FFmpeg's network-capable input protocols on the
+// roadmap, just reached through a document instead of a filename. That
+// application-level reject-list is a best-effort blocklist, not a full
+// sanitizer (see validateHTMLForPDF); real defense in depth still wants the
+// LibreOffice worker denied outbound network access at the OS/container
+// level, which remains follow-up hardening (see ROADMAP.md), same as the
+// egress-denied worker isolation already noted for Office->PDF.
+func (c *converter) convertMarkupToPDF(ctx context.Context, in, inPath, outPath string) error {
+	if c.libreoffice == "" {
+		return errors.New("PDF rendering is not available")
+	}
+	b, err := os.ReadFile(inPath)
+	if err != nil {
+		return err
+	}
+	html := b
+	if in == "markdown" {
+		var buf bytes.Buffer
+		if err := goldmark.Convert(b, &buf); err != nil {
+			return err
+		}
+		html = []byte("<!doctype html>\n<html><head><meta charset=\"utf-8\"></head><body>\n" + buf.String() + "</body></html>\n")
+	}
+	if err := validateHTMLForPDF(html); err != nil {
+		return err
+	}
+	workDir, err := os.MkdirTemp(filepath.Dir(inPath), ".libreoffice-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(workDir)
+	if err := os.Chmod(workDir, 0700); err != nil {
+		return err
+	}
+	staged := filepath.Join(workDir, "input.html")
+	if err := os.WriteFile(staged, html, 0600); err != nil {
+		return err
+	}
+	// No format-specific --convert-to filter name (unlike convertOffice's
+	// officePDFFilterName): pdfMode never applies to this pair (see
+	// resolvePDFMode), and a dedicated HTML PDF-export filter name/option
+	// set could not be found in LibreOffice's own filter documentation to
+	// verify rather than guess, so this deliberately lets LibreOffice
+	// auto-select its default export filter for whatever it imported.
+	return c.convertViaLibreOffice(ctx, workDir, staged, "pdf", outPath)
+}
+
+// convertViaLibreOffice runs headless LibreOffice's --convert-to against
+// staged (already placed under workDir, named with the extension
+// LibreOffice needs to detect the right import filter), verifies a
+// non-empty PDF came out, and moves it to outPath. Shared by convertOffice
+// and convertMarkupToPDF, which differ only in how the input gets staged
+// and which --convert-to filter string applies.
+func (c *converter) convertViaLibreOffice(ctx context.Context, workDir, staged, convertTo, outPath string) error {
 	profile := filepath.Join(workDir, "profile")
 	if err := os.Mkdir(profile, 0700); err != nil {
 		return err
 	}
 	profileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(profile)}).String()
-	convertTo := "pdf"
-	if opts := officePDFFilterOptions(in, pdfMode); opts != "" {
-		convertTo = "pdf:" + officePDFFilterName[in] + ":" + opts
-	}
 	cmd := exec.CommandContext(ctx, c.libreoffice,
 		"--headless", "--invisible", "--nologo", "--nodefault", "--nolockcheck", "--norestore",
 		"-env:UserInstallation="+profileURL,
@@ -296,12 +376,12 @@ func (c *converter) convertOffice(ctx context.Context, in, pdfMode, inPath, outP
 	cmd.Env = officeEnvironment(c.libreoffice, workDir)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("Office conversion failed: %w (%s)", err, strings.TrimSpace(string(output)))
+		return fmt.Errorf("LibreOffice conversion failed: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
-	generated := filepath.Join(workDir, "input.pdf")
+	generated := strings.TrimSuffix(staged, filepath.Ext(staged)) + ".pdf"
 	info, err := os.Stat(generated)
 	if err != nil || !info.Mode().IsRegular() || info.Size() == 0 {
-		return fmt.Errorf("Office conversion produced no PDF (%s)", strings.TrimSpace(string(output)))
+		return fmt.Errorf("LibreOffice conversion produced no PDF (%s)", strings.TrimSpace(string(output)))
 	}
 	if err := os.Rename(generated, outPath); err != nil {
 		return err

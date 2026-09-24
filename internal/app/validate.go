@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 
@@ -188,6 +189,45 @@ const (
 	// worst case to 300 rendered files zipped into one output.
 	maxPDFPages = 300
 )
+
+// dangerousHTMLPattern is a best-effort reject-list for HTML about to be
+// rendered by LibreOffice for PDF export (see convertMarkupToPDF), not a
+// full sanitizer—matching this codebase's existing rejectActiveContent
+// (only "<?php"/"<?="), it deliberately trades completeness for a simple,
+// auditable rule. It flags: known active-content tags (script/iframe and
+// friends, plus <base>, which can redirect every *relative* URL in the
+// document to an attacker-chosen host); inline event-handler attributes
+// (onload=, onclick=, ...); javascript: URIs; and any src/srcset, <link
+// href>, or CSS url(...) reference that resolves to an absolute or
+// protocol-relative external URL (http(s)/ftp/file/"//")—the references
+// LibreOffice actually fetches while rendering, unlike a plain <a href>
+// hyperlink, which just becomes a clickable annotation in the exported
+// PDF and is deliberately left alone here (mirroring validateOOXML's own
+// allowance for hyperlink relationships). A relative reference (a local
+// image path, say) is left alone too: it can't resolve to anything since
+// the staged HTML is the only file in its per-job working directory, so
+// it just renders as a missing image rather than being fetched from
+// anywhere.
+var dangerousHTMLPattern = regexp.MustCompile(`(?i)<(?:script|iframe|object|embed|applet|base)\b` +
+	`|\son\w+\s*=` +
+	`|javascript:` +
+	`|\b(?:src|srcset)\s*=\s*["']?\s*(?:https?:|ftp:|file:|//)` +
+	`|<link\b[^>]*\bhref\s*=\s*["']?\s*(?:https?:|ftp:|file:|//)` +
+	`|url\(\s*["']?\s*(?:https?:|ftp:|file:|//)`)
+
+// validateHTMLForPDF gates convertMarkupToPDF's input (original HTML
+// uploads, and goldmark-rendered HTML from a Markdown upload) right before
+// it's handed to LibreOffice: that conversion actually renders the
+// document with a real layout engine that resolves references, unlike the
+// pure-Go HTML<->Markdown text transform this codebase already had, which
+// never fetches or executes anything. See dangerousHTMLPattern for what's
+// rejected and why.
+func validateHTMLForPDF(html []byte) error {
+	if dangerousHTMLPattern.Match(html) {
+		return errors.New("HTML contains active content or an external resource reference, which is not accepted for PDF rendering")
+	}
+	return nil
+}
 
 func validateOOXML(format, path string) error {
 	zr, err := zip.OpenReader(path)

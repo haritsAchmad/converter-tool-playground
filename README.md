@@ -8,9 +8,9 @@ Small, self-hosted file conversion service with deliberately short-lived storage
 |---|---|---|
 | Structured data | CSV, JSON, XML, YAML | CSV output requires an array of flat objects. XML uses a deterministic generic representation. |
 | Images | PNG, JPEG/JPG, WebP | PNG↔JPEG is native Go. WebP appears only when ImageMagick is installed. Metadata is stripped on ImageMagick conversions. PNG/JPEG/WebP → PDF is native Go (pdfcpu) and always available: one page, sized to the source image at 150 DPI. |
-| Documents | Markdown, HTML | Markdown output is a best-effort semantic conversion. |
+| Documents | Markdown, HTML | Markdown↔HTML is a best-effort semantic conversion. Markdown/HTML → PDF uses the same isolated, headless LibreOffice profiles as Office→PDF (Markdown is rendered to HTML first, via goldmark's default safe mode, then handed to LibreOffice); the resulting HTML is rejected rather than rendered if it contains `<script>`/active content or any reference to an external resource (an image, stylesheet, etc. that would otherwise be fetched during rendering)—an ordinary hyperlink is unaffected. Appears only when `libreoffice`/`soffice` is installed. |
 | Office | DOCX, XLSX, PPTX → PDF | Uses isolated, headless LibreOffice profiles. Complex Microsoft-specific layout may render differently. Optional `pdfMode=optimized` (default `standard`, plain export) forces every Calc sheet onto one page, embeds standard fonts, and downsamples images to 150 DPI—see [Office → PDF fidelity modes](#office--pdf-fidelity-modes). |
-| PDF | PDF → PNG/JPEG | Renders every page (up to 300) at a fixed 150 DPI via poppler's `pdftoppm`, packaged as a ZIP with one `page-N.png`/`page-N.jpg` entry per page—even for a one-page source; appears only when `pdftoppm` is installed. PDF as an output format for non-image sources is future work. |
+| PDF | PDF → PNG/JPEG | Renders every page (up to 300) at a fixed 150 DPI via poppler's `pdftoppm`, packaged as a ZIP with one `page-N.png`/`page-N.jpg` entry per page—even for a one-page source; appears only when `pdftoppm` is installed. PDF as an output format for structured-data sources is future work. |
 
 The API returns capabilities at runtime, so unavailable engines are not advertised. PDF-to-Office, legacy Office formats, macro-enabled documents, audio, and video are intentionally not enabled; see [ROADMAP.md](ROADMAP.md).
 
@@ -30,7 +30,7 @@ Run locally with Go 1.24+:
 go run ./cmd/convertbox
 ```
 
-ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; poppler-utils likewise enables PDF→image when `pdftoppm` is on `PATH`; and LibreOffice enables DOCX/XLSX/PPTX→PDF when `libreoffice` or `soffice` is on `PATH`. The Docker image includes all three. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
+ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; poppler-utils likewise enables PDF→image when `pdftoppm` is on `PATH`; and LibreOffice enables DOCX/XLSX/PPTX→PDF and Markdown/HTML→PDF when `libreoffice` or `soffice` is on `PATH`. The Docker image includes all three. For anything reachable beyond localhost, see [Deploying beyond localhost](#deploying-beyond-localhost) below before you open it up.
 
 ## Configuration
 
@@ -88,7 +88,7 @@ DOCX/XLSX/PPTX → PDF jobs accept an optional `pdfMode` field, and the bundled 
 | `standard` (default) | Passes no LibreOffice export filter options at all—whatever page setup, fonts, and image fidelity the source document's own styles specify come through exactly as opening File → Export As PDF would produce, with nothing rewritten. |
 | `optimized` | Sets `SinglePageSheets` (Calc only—forces every sheet onto exactly one PDF page regardless of its own print area/paper size), `EmbedStandardFonts` (avoids silent font substitution in the reader), and `ReduceImageResolution`/`MaxImageResolution=150` (smaller file, downsampled images). This is a deliberate, opt-in trade-off—layout can shift from what the source document would otherwise print as—never the default. |
 
-`pdfMode` is rejected with `400` for any pair other than Office→PDF; it doesn't apply to image→PDF (that path is unrelated pure-Go code, not LibreOffice) or to PDF→image.
+`pdfMode` is rejected with `400` for any pair other than Office→PDF; it doesn't apply to image→PDF (that path is unrelated pure-Go code, not LibreOffice) or to PDF→image. It also doesn't apply to Markdown/HTML→PDF, even though that pair goes through LibreOffice too—those filter options are Office-format-specific (Calc sheets, embedded fonts tuned for Word/Calc/Impress output) and have no equivalent for a rendered HTML document.
 
 ```sh
 curl -F file=@report.xlsx -F outputFormat=pdf -F pdfMode=optimized \
