@@ -12,8 +12,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 func testApp(t *testing.T) *App {
@@ -66,6 +69,68 @@ func TestCSVToJSONJob(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("job did not complete")
+}
+
+// TestJobFailsAfterMaxAttempts proves the poison-pill guard in App.worker:
+// a job that has already been picked up MaxJobAttempts times (simulating a
+// worker crashing and the queue requeuing it on every restart, which is what
+// a Redis worker's requeueActive does unconditionally) is marked Failed on
+// its next pickup instead of being processed and requeued indefinitely.
+func TestJobFailsAfterMaxAttempts(t *testing.T) {
+	cfg := Config{Address: ":0", StorageRoot: t.TempDir(), MaxUploadBytes: 1 << 20, Workers: 1, QueueSize: 2, JobTimeout: time.Second, JobTTL: time.Minute, CleanupInterval: time.Hour, UploadTimeout: time.Second, RateRPS: 100, RateBurst: 100, MaxJobsPerIP: 100, MaxJobAttempts: 2}
+	a, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
+
+	id := uuid.New().String()
+	dir := filepath.Join(cfg.StorageRoot, id)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	inputPath := filepath.Join(dir, "input.bin")
+	if err := os.WriteFile(inputPath, []byte("name,age\nAda,36\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(dir, "output.json")
+	now := time.Now().UTC()
+	j := &Job{
+		ID: id, Status: Queued, InputFormat: "csv", OutputFormat: "json",
+		OriginalName: "people.csv", OutputName: "converted.json",
+		Attempts:  cfg.MaxJobAttempts, // already exhausted by prior crash+requeue cycles
+		CreatedAt: now, ExpiresAt: now.Add(time.Minute),
+		InputPath: inputPath, OutputPath: outputPath,
+		mu: &sync.RWMutex{},
+	}
+	a.store.add(j)
+	if err := a.store.persist(j); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.queue.Enqueue(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, ok := a.store.get(id)
+		if ok {
+			if snap := got.snapshot(); snap.Status == Failed {
+				if snap.Error != "exceeded max processing attempts" {
+					t.Fatalf("unexpected error message: %q", snap.Error)
+				}
+				if snap.Attempts != cfg.MaxJobAttempts+1 {
+					t.Fatalf("expected attempts %d, got %d", cfg.MaxJobAttempts+1, snap.Attempts)
+				}
+				if _, err := os.Stat(outputPath); err == nil {
+					t.Fatal("job that exceeded its attempt cap should never have been converted")
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("job did not fail after exceeding max attempts")
 }
 
 // submitJob is a small generalization of TestCSVToJSONJob's inline

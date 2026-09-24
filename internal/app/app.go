@@ -48,6 +48,9 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if cfg.Mode == "" {
 		cfg.Mode = "standalone"
 	}
+	if cfg.MaxJobAttempts < 1 {
+		cfg.MaxJobAttempts = 3
+	}
 	s, err := newStore(cfg.StorageRoot)
 	if err != nil {
 		return nil, err
@@ -340,10 +343,40 @@ func (a *App) worker(index int) {
 			return
 		default:
 		}
+		// Persist the incremented attempt count before doing any work, so a
+		// worker crash mid-conversion (panic, OOM-kill) still leaves the new
+		// count on disk. A Redis worker unconditionally requeues everything
+		// left in :processing on startup (see requeueActive), so without this
+		// a job that reliably crashes the process would loop forever instead
+		// of eventually landing in Failed.
+		var attempts int
+		j.update(func(x *Job) { x.Attempts++; attempts = x.Attempts })
+		if err := a.store.persist(j); err != nil {
+			a.log.Warn("failed to persist job attempt count", "job_id", j.ID, "error", err)
+		}
+		if attempts > a.cfg.MaxJobAttempts {
+			a.failExhausted(index, j, attempts)
+			a.ackJob(id, index)
+			continue
+		}
 		if a.process(index, j) {
 			a.ackJob(id, index)
 		}
 	}
+}
+func (a *App) failExhausted(index int, j *Job, attempts int) {
+	now := time.Now().UTC()
+	j.update(func(x *Job) {
+		x.Status = Failed
+		x.Error = "exceeded max processing attempts"
+		x.FinishedAt = &now
+		x.ExpiresAt = now.Add(a.cfg.JobTTL)
+	})
+	if err := a.store.persist(j); err != nil {
+		a.log.Warn("failed to persist exhausted job state", "job_id", j.ID, "error", err)
+	}
+	a.metrics.jobsTotal.WithLabelValues(string(Failed), j.InputFormat, j.OutputFormat).Inc()
+	a.log.Warn("job exceeded max processing attempts, giving up", "job_id", j.ID, "attempts", attempts, "max_attempts", a.cfg.MaxJobAttempts, "worker", index)
 }
 func (a *App) ackJob(id string, index int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

@@ -23,7 +23,11 @@ type Job struct {
 	OutputName   string `json:"outputName,omitempty"`
 	// PDFMode is "standard" or "optimized", set only for Office->PDF jobs
 	// (see convertOffice); empty for every other conversion pair.
-	PDFMode    string     `json:"pdfMode,omitempty"`
+	PDFMode string `json:"pdfMode,omitempty"`
+	// Attempts counts every time a worker has picked this job up for
+	// processing, persisted before each attempt so it survives a worker
+	// crash and a subsequent queue requeue (see App.worker).
+	Attempts   int        `json:"attempts,omitempty"`
 	Size       int64      `json:"size"`
 	CreatedAt  time.Time  `json:"createdAt"`
 	FinishedAt *time.Time `json:"finishedAt,omitempty"`

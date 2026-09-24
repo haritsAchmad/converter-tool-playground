@@ -18,6 +18,7 @@ type Config struct {
 	ScanTimeout                                        time.Duration
 	RateRPS, RateBurst                                 float64
 	MaxJobsPerIP                                       int
+	MaxJobAttempts                                     int
 }
 
 func LoadConfig() (Config, error) {
@@ -39,9 +40,13 @@ func LoadConfig() (Config, error) {
 		RateRPS:         envFloat("CONVERTBOX_RATE_RPS", 1),
 		RateBurst:       envFloat("CONVERTBOX_RATE_BURST", 5),
 		MaxJobsPerIP:    envInt("CONVERTBOX_MAX_JOBS_PER_IP", 4),
+		MaxJobAttempts:  envInt("CONVERTBOX_MAX_JOB_ATTEMPTS", 3),
 	}
 	if c.Workers < 1 || c.QueueSize < 1 || c.MaxUploadBytes < 1 || c.JobTTL < time.Minute {
 		return c, fmt.Errorf("workers, queue, size must be positive and TTL at least 1m")
+	}
+	if c.MaxJobAttempts < 1 {
+		return c, fmt.Errorf("max job attempts must be positive")
 	}
 	if c.RateRPS <= 0 || c.RateBurst < 1 || c.MaxJobsPerIP < 1 {
 		return c, fmt.Errorf("rate rps/burst and max jobs per IP must be positive")

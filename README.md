@@ -44,6 +44,7 @@ ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; p
 | `CONVERTBOX_MAX_MB` | `25` | Per-upload limit |
 | `CONVERTBOX_WORKERS` | `2` | Concurrent conversions |
 | `CONVERTBOX_QUEUE_SIZE` | `20` | Bounded waiting queue |
+| `CONVERTBOX_MAX_JOB_ATTEMPTS` | `3` | Max times a worker will pick up the same job before marking it `failed` instead of requeuing it again; guards against a job that reliably crashes the worker process looping forever |
 | `CONVERTBOX_JOB_TIMEOUT` | `45s` | Per-job deadline |
 | `CONVERTBOX_JOB_TTL` | `20m` | Retention after completion |
 | `CONVERTBOX_CLEANUP_INTERVAL` | `1m` | Cleanup sweep interval |
