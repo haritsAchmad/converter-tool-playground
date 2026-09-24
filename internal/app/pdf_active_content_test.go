@@ -136,3 +136,24 @@ func TestValidatePDFRejectsEmbeddedFileAttachment(t *testing.T) {
 		t.Fatal("expected a PDF with an embedded file attachment to be rejected")
 	}
 }
+
+// TestValidatePDFRejectsFileAttachmentAnnotation proves an attachment
+// declared entirely through a page's /Annots (a /Subtype /FileAttachment
+// annotation carrying its own /FS/EF, PDF's "paperclip icon" attachment)
+// is rejected even with no /EmbeddedFiles name tree at all—the gap
+// neither Names["EmbeddedFiles"] nor ctx.ListAttachments() covers on
+// their own, since both only look at the catalog's Names dictionary
+// (temuan review P2).
+func TestValidatePDFRejectsFileAttachmentAnnotation(t *testing.T) {
+	pdf := buildTestPDF(t, 1, map[int]string{
+		1: "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+		2: "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+		3: "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Annots [4 0 R] >>\nendobj\n",
+		4: "4 0 obj\n<< /Type /Annot /Subtype /FileAttachment /Rect [0 0 10 10] /FS 5 0 R >>\nendobj\n",
+		5: "5 0 obj\n<< /Type /Filespec /F (payload.txt) /EF << /F 6 0 R >> >>\nendobj\n",
+		6: "6 0 obj\n<< /Type /EmbeddedFile /Length 4 >>\nstream\ntest\nendstream\nendobj\n",
+	})
+	if err := validatePDFFixture(t, pdf); err == nil {
+		t.Fatal("expected a PDF with a FileAttachment annotation to be rejected")
+	}
+}

@@ -216,17 +216,22 @@ const (
 // validatePDFActiveContent rejects a PDF carrying a mechanism that runs
 // code or exfiltrates data automatically the moment a document-processing
 // tool opens it, without needing any user interaction: an embedded
-// JavaScript name tree, an embedded file attachment, or a document-level
+// JavaScript name tree, an embedded file attachment (via the
+// /EmbeddedFiles name tree, ctx.ListAttachments(), or an annotation's own
+// /FS/EF—see validatePDFAnnotationAttachments), or a document-level
 // /OpenAction or /AA (additional actions) entry on the catalog. This is a
-// best-effort, document-level pass, not an exhaustive one—matching this
-// codebase's existing honesty about narrower-than-ideal reject-lists (see
-// e.g. rejectActiveContent's "<?php"/"<?=" pair): it deliberately does not
-// walk every page/annotation/form-field looking for a per-object action
-// dict (a Link annotation's own /A, or a form field's own /AA), since
-// those generally only fire on explicit user interaction (clicking a
-// link, editing a field) that this service's pdftoppm-based rendering
-// pipeline never performs. Verified against pdfcpu's own validation
-// source (pkg/pdfcpu/validate/xReftable.go's validateNames, which is what
+// best-effort pass, not an exhaustive one—matching this codebase's
+// existing honesty about narrower-than-ideal reject-lists (see e.g.
+// rejectActiveContent's "<?php"/"<?=" pair): it rejects attachments
+// wherever they're actually declared (the Names tree and every page's
+// annotations), but still deliberately does not walk every annotation/
+// form-field looking for a per-object ACTION dict (a Link annotation's
+// own /A, or a form field's own /AA)—unlike an attachment, which is
+// inert data sitting in the file regardless of interaction, those actions
+// only fire on explicit user interaction (clicking a link, editing a
+// field) that this service's pdftoppm-based rendering pipeline never
+// performs. Verified against pdfcpu's own validation source
+// (pkg/pdfcpu/validate/xReftable.go's validateNames, which is what
 // populates XRefTable.Names["JavaScript"]/["EmbeddedFiles"] during
 // Validate/ReadAndValidate) rather than guessed.
 func validatePDFActiveContent(ctx *model.Context) error {
@@ -243,11 +248,63 @@ func validatePDFActiveContent(ctx *model.Context) error {
 	if len(attachments) > 0 {
 		return errors.New("PDF contains an embedded file attachment, which is not accepted")
 	}
+	if err := validatePDFAnnotationAttachments(ctx); err != nil {
+		return err
+	}
 	if ctx.RootDict.HasEntry("OpenAction") {
 		return errors.New("PDF contains a document open action, which is not accepted")
 	}
 	if ctx.RootDict.HasEntry("AA") {
 		return errors.New("PDF document-level additional actions are not accepted")
+	}
+	return nil
+}
+
+// validatePDFAnnotationAttachments rejects a file attached via a page
+// annotation's own /FS (file specification) entry—most commonly a
+// /Subtype /FileAttachment annotation, PDF's "paperclip icon" attachment,
+// but checked generically for any annotation carrying a Filespec with an
+// /EF (embedded file) entry, since that combination is what actually
+// makes a Filespec an embedded-file reference regardless of which
+// annotation subtype carries it. Neither the /EmbeddedFiles name tree nor
+// ctx.ListAttachments() covers this: both only look at the catalog's
+// Names dictionary, and a page annotation's /FS never has to be
+// registered there at all (temuan review P2)—this is genuinely inert
+// attached data sitting in the file the moment it's opened, not an
+// action that needs a click to reach, so it's in scope even though this
+// codebase deliberately doesn't walk per-annotation ACTION dicts (see
+// validatePDFActiveContent's doc comment).
+func validatePDFAnnotationAttachments(ctx *model.Context) error {
+	for pageNr := 1; pageNr <= ctx.PageCount; pageNr++ {
+		pageDict, _, _, err := ctx.PageDict(pageNr, false)
+		if err != nil {
+			return fmt.Errorf("could not read PDF page %d: %w", pageNr, err)
+		}
+		annotsObj, ok := pageDict.Find("Annots")
+		if !ok {
+			continue
+		}
+		annots, err := ctx.DereferenceArray(annotsObj)
+		if err != nil {
+			return fmt.Errorf("could not read PDF page %d annotations: %w", pageNr, err)
+		}
+		for _, annotObj := range annots {
+			annotDict, err := ctx.DereferenceDict(annotObj)
+			if err != nil {
+				return fmt.Errorf("could not read PDF page %d annotation: %w", pageNr, err)
+			}
+			fsObj, ok := annotDict.Find("FS")
+			if !ok {
+				continue
+			}
+			fsDict, err := ctx.DereferenceDict(fsObj)
+			if err != nil {
+				return fmt.Errorf("could not read PDF page %d annotation file specification: %w", pageNr, err)
+			}
+			if fsDict.HasEntry("EF") {
+				return errors.New("PDF contains an embedded file attachment, which is not accepted")
+			}
+		}
 	}
 	return nil
 }
@@ -440,7 +497,9 @@ var dataURIImageSignatures = []struct {
 }{
 	{"image/png", func(b []byte) bool { return bytes.HasPrefix(b, []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}) }},
 	{"image/jpeg", func(b []byte) bool { return len(b) >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff }},
-	{"image/gif", func(b []byte) bool { return bytes.HasPrefix(b, []byte("GIF87a")) || bytes.HasPrefix(b, []byte("GIF89a")) }},
+	{"image/gif", func(b []byte) bool {
+		return bytes.HasPrefix(b, []byte("GIF87a")) || bytes.HasPrefix(b, []byte("GIF89a"))
+	}},
 }
 
 // isSafeDataURI parses a data: URI (RFC 2397: "data:[<mediatype>][;base64],<data>")
