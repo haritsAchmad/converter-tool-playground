@@ -56,23 +56,67 @@ type redisJobQueue struct {
 	limit  int64
 }
 
-func newJobQueue(cfg Config) (jobQueue, error) {
+// newJobQueue builds one job queue bound to queueKey (the general queue or
+// the isolated PDF queue—see App.queueFor and the pdf-worker mode). A
+// standalone deployment has no Redis at all, so it always gets an
+// in-process local queue regardless of queueKey; App.New reuses that same
+// local queue for both roles rather than creating two, since a single
+// process has nothing to isolate a second queue from anyway. requeueOnStart
+// recovers jobs a previous crash left stuck in this specific queue's
+// :processing list—only the role that actually drains queueKey should pass
+// true, so a worker recovering the general queue doesn't also (redundantly,
+// and via a Redis connection it has no other reason to hold) try to recover
+// the PDF queue's, or vice versa.
+func newJobQueue(cfg Config, queueKey string, requeueOnStart bool) (jobQueue, error) {
 	if cfg.Mode == "standalone" {
 		return newLocalJobQueue(cfg.QueueSize), nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	queue, err := newRedisJobQueue(ctx, cfg.RedisURL, cfg.RedisQueue, cfg.QueueSize)
+	queue, err := newRedisJobQueue(ctx, cfg.RedisURL, queueKey, cfg.QueueSize)
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Mode == "worker" {
+	if requeueOnStart {
 		if err := queue.requeueActive(ctx); err != nil {
 			_ = queue.Close()
 			return nil, fmt.Errorf("could not recover active redis jobs: %w", err)
 		}
 	}
 	return queue, nil
+}
+
+// newQueuesForMode builds the queue(s) this process's role actually needs.
+// "worker" only ever gets the general queue: PDF input jobs are never
+// enqueued there in the first place (see App.queueFor), so it has no
+// reason to hold a second Redis connection or recover a PDF :processing
+// list it never populates. "pdf-worker" is the mirror image: only the PDF
+// queue, recovered on start the same way "worker" recovers the general
+// one. "api" (the only role that creates jobs) needs both, to route each
+// new job to the right one; neither is recovered here since "api" is
+// never the one draining them. "standalone" reuses one local queue for
+// both, since a single process has nothing to isolate a second queue
+// from. If building the second queue for "api" fails, the first is closed
+// rather than leaked.
+func newQueuesForMode(cfg Config) (queue, pdfQueue jobQueue, err error) {
+	switch cfg.Mode {
+	case "standalone":
+		queue, err = newJobQueue(cfg, cfg.RedisQueue, false)
+		pdfQueue = queue
+	case "api":
+		if queue, err = newJobQueue(cfg, cfg.RedisQueue, false); err != nil {
+			return nil, nil, err
+		}
+		if pdfQueue, err = newJobQueue(cfg, cfg.RedisPDFQueue, false); err != nil {
+			_ = queue.Close()
+			return nil, nil, err
+		}
+	case "worker":
+		queue, err = newJobQueue(cfg, cfg.RedisQueue, true)
+	case "pdf-worker":
+		pdfQueue, err = newJobQueue(cfg, cfg.RedisPDFQueue, true)
+	}
+	return queue, pdfQueue, err
 }
 
 func newRedisJobQueue(ctx context.Context, rawURL, key string, limit int) (*redisJobQueue, error) {

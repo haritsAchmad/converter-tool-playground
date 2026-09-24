@@ -88,6 +88,40 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # Runs PDF->image jobs only, off their own Redis queue, so a hostile PDF
+  # that ever finds a bug in poppler's pdftoppm compromises this container
+  # instead of the shared `worker` handling every other conversion
+  # (Office/ODF/Markdown/HTML->PDF via LibreOffice, images, structured
+  # data). Same image as `worker`--pdftoppm is already in it--just a
+  # different CONVERTBOX_MODE and a lighter resource envelope, since it
+  # never has to run memory-hungry LibreOffice.
+  pdf-worker:
+    build: .
+    read_only: true
+    volumes:
+      - jobs:/data
+    cpus: 1.0
+    mem_limit: 384m
+    pids_limit: 64
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    environment:
+      CONVERTBOX_MODE: "pdf-worker"
+      CONVERTBOX_STORAGE: "/data"
+      CONVERTBOX_REDIS_URL: "redis://redis:6379/0"
+      CONVERTBOX_WORKERS: "2"
+      CONVERTBOX_QUEUE_SIZE: "20"
+      CONVERTBOX_JOB_TIMEOUT: "45s"
+      CONVERTBOX_JOB_TTL: "20m"
+    depends_on:
+      storage-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # Optional TLS-terminating reverse proxy for exposing `api` beyond
   # localhost. Off by default; enable with `docker compose --profile proxy up`.
   # See deploy/Caddyfile for the public-domain vs. internal/LAN setup.

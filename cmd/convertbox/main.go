@@ -39,8 +39,8 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if cfg.Mode == "worker" {
-		logger.Info("conversion worker started", "workers", cfg.Workers, "storage", cfg.StorageRoot)
+	if cfg.Mode == "worker" || cfg.Mode == "pdf-worker" {
+		logger.Info("conversion worker started", "mode", cfg.Mode, "workers", cfg.Workers, "storage", cfg.StorageRoot)
 		<-ctx.Done()
 		return
 	}

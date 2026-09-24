@@ -35,13 +35,18 @@ type App struct {
 	store     *store
 	converter *converter
 	queue     jobQueue
-	limiter   *rateLimiter
-	metrics   *metrics
-	registry  *prometheus.Registry
-	scanner   malwareScanner
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	// pdfQueue is the isolated queue for PDF input jobs (see the
+	// pdf-worker Config.Mode)—nil in "worker" mode, which never touches
+	// PDF jobs, and the same instance as queue in "standalone" mode,
+	// which has nothing to isolate a second queue from. See queueFor.
+	pdfQueue jobQueue
+	limiter  *rateLimiter
+	metrics  *metrics
+	registry *prometheus.Registry
+	scanner  malwareScanner
+	ctx      context.Context
+	cancel   context.CancelFunc
+	wg       sync.WaitGroup
 }
 
 func New(cfg Config, logger *slog.Logger) (*App, error) {
@@ -59,35 +64,59 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	queue, err := newJobQueue(cfg)
+	queue, pdfQueue, err := newQueuesForMode(cfg)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	m := newMetrics(registry, queue.Depth)
+	m := newMetrics(registry, queueDepthFunc(queue), queueDepthFunc(pdfQueue))
 	a := &App{
 		cfg: cfg, log: logger, store: s, converter: newConverter(),
-		queue: queue, limiter: newRateLimiter(cfg.RateRPS, cfg.RateBurst),
+		queue: queue, pdfQueue: pdfQueue, limiter: newRateLimiter(cfg.RateRPS, cfg.RateBurst),
 		metrics: m, registry: registry, scanner: scanner, ctx: ctx, cancel: cancel,
 	}
 	s.recover(time.Now().UTC(), logger, cfg.Mode == "standalone", cfg.Mode == "standalone")
-	if cfg.Mode != "api" {
+	switch cfg.Mode {
+	case "standalone", "worker":
 		for i := 0; i < cfg.Workers; i++ {
 			a.wg.Add(1)
-			go a.worker(i)
+			go a.worker(i, a.queue)
+		}
+	case "pdf-worker":
+		for i := 0; i < cfg.Workers; i++ {
+			a.wg.Add(1)
+			go a.worker(i, a.pdfQueue)
 		}
 	}
-	if cfg.Mode != "worker" {
+	if cfg.Mode != "worker" && cfg.Mode != "pdf-worker" {
 		a.wg.Add(1)
 		go a.janitor()
 	}
 	return a, nil
 }
+
+// queueDepthFunc adapts a possibly-nil jobQueue (this process's role may
+// not have one—see App.pdfQueue) into a metrics.GaugeFunc that reports 0
+// rather than panicking when there's nothing to report on.
+func queueDepthFunc(q jobQueue) func() float64 {
+	return func() float64 {
+		if q == nil {
+			return 0
+		}
+		return q.Depth()
+	}
+}
+
 func (a *App) Close() {
 	a.cancel()
-	_ = a.queue.Close()
+	if a.queue != nil {
+		_ = a.queue.Close()
+	}
+	if a.pdfQueue != nil && a.pdfQueue != a.queue {
+		_ = a.pdfQueue.Close()
+	}
 	a.wg.Wait()
 }
 
@@ -228,7 +257,7 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "could not persist job")
 		return
 	}
-	if err := a.queue.Enqueue(r.Context(), j.ID); err == nil {
+	if err := a.queueFor(in).Enqueue(r.Context(), j.ID); err == nil {
 		keep = true
 		writeJSON(w, http.StatusAccepted, j.snapshot())
 	} else {
@@ -317,10 +346,24 @@ func (a *App) validJob(id string) (*Job, bool) {
 	return j, true
 }
 
-func (a *App) worker(index int) {
+// queueFor picks which queue a job with input format in belongs on: the
+// isolated PDF queue when this process has one (api, or pdf-worker
+// itself) and the job's input is a PDF, the general queue otherwise. A
+// pdf-worker's own worker loop dequeues straight from a.pdfQueue and
+// never calls this; it only matters for routing a new job at creation
+// time. See pdfQueue's doc comment and the "pdf-worker" Mode for why PDF
+// input specifically is isolated from the shared worker pool.
+func (a *App) queueFor(in string) jobQueue {
+	if in == "pdf" && a.pdfQueue != nil {
+		return a.pdfQueue
+	}
+	return a.queue
+}
+
+func (a *App) worker(index int, q jobQueue) {
 	defer a.wg.Done()
 	for {
-		id, err := a.queue.Dequeue(a.ctx)
+		id, err := q.Dequeue(a.ctx)
 		if err != nil {
 			if a.ctx.Err() != nil {
 				return
@@ -331,11 +374,11 @@ func (a *App) worker(index int) {
 		j, ok := a.store.reload(id)
 		if !ok {
 			a.log.Warn("queued job state is unavailable", "job_id", id, "worker", index)
-			a.ackJob(id, index)
+			a.ackJob(id, index, q)
 			continue
 		}
 		if status := j.snapshot().Status; status == Completed || status == Failed {
-			a.ackJob(id, index)
+			a.ackJob(id, index, q)
 			continue
 		}
 		select {
@@ -356,11 +399,11 @@ func (a *App) worker(index int) {
 		}
 		if attempts > a.cfg.MaxJobAttempts {
 			a.failExhausted(index, j, attempts)
-			a.ackJob(id, index)
+			a.ackJob(id, index, q)
 			continue
 		}
 		if a.process(index, j) {
-			a.ackJob(id, index)
+			a.ackJob(id, index, q)
 		}
 	}
 }
@@ -378,10 +421,10 @@ func (a *App) failExhausted(index int, j *Job, attempts int) {
 	a.metrics.jobsTotal.WithLabelValues(string(Failed), j.InputFormat, j.OutputFormat).Inc()
 	a.log.Warn("job exceeded max processing attempts, giving up", "job_id", j.ID, "attempts", attempts, "max_attempts", a.cfg.MaxJobAttempts, "worker", index)
 }
-func (a *App) ackJob(id string, index int) {
+func (a *App) ackJob(id string, index int, q jobQueue) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := a.queue.Ack(ctx, id); err != nil {
+	if err := q.Ack(ctx, id); err != nil {
 		a.log.Warn("failed to acknowledge job", "job_id", id, "worker", index, "error", err)
 	}
 }

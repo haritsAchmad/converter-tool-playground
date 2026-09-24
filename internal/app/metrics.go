@@ -13,7 +13,7 @@ type metrics struct {
 	rateLimited  prometheus.Counter
 }
 
-func newMetrics(reg *prometheus.Registry, queueLength func() float64) *metrics {
+func newMetrics(reg *prometheus.Registry, queueLength, pdfQueueLength func() float64) *metrics {
 	f := promauto.With(reg)
 	m := &metrics{
 		httpRequests: f.NewCounterVec(prometheus.CounterOpts{
@@ -41,7 +41,11 @@ func newMetrics(reg *prometheus.Registry, queueLength func() float64) *metrics {
 	}
 	f.NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "convertbox_queue_length",
-		Help: "Current number of jobs waiting in the conversion queue.",
+		Help: "Current number of jobs waiting in the general conversion queue (0 in a role, e.g. pdf-worker, that doesn't hold this queue).",
 	}, queueLength)
+	f.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "convertbox_pdf_queue_length",
+		Help: "Current number of PDF input jobs waiting in the isolated PDF queue (0 in a role, e.g. worker, that doesn't hold this queue).",
+	}, pdfQueueLength)
 	return m
 }

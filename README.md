@@ -23,7 +23,7 @@ With Docker (recommended):
 docker compose up --build
 ```
 
-Open <http://localhost:8080>. Compose starts separate API and conversion-worker containers, a Redis-backed queue, and a shared job volume. Application containers run as UID 10001 with read-only root filesystems, drop all Linux capabilities, prevent privilege escalation, and limit CPU, memory, and PIDs.
+Open <http://localhost:8080>. Compose starts separate API, conversion-worker, and PDF-worker containers, a Redis-backed queue, and a shared job volume—PDF input is rendered by its own worker off its own queue, isolated from every other conversion (see [PDF worker isolation](#pdf-worker-isolation)). Application containers run as UID 10001 with read-only root filesystems, drop all Linux capabilities, prevent privilege escalation, and limit CPU, memory, and PIDs.
 
 Run locally with Go 1.24+:
 
@@ -38,10 +38,11 @@ ImageMagick 7 is optional locally and enables WebP when `magick` is on `PATH`; p
 | Variable | Default | Purpose |
 |---|---:|---|
 | `CONVERTBOX_ADDR` | `:8080` | HTTP listen address |
-| `CONVERTBOX_MODE` | `standalone` | `standalone`, `api`, or `worker` process role |
+| `CONVERTBOX_MODE` | `standalone` | `standalone`, `api`, `worker`, or `pdf-worker` process role—see [PDF worker isolation](#pdf-worker-isolation) for the last one |
 | `CONVERTBOX_STORAGE` | OS temp + `convertbox` | Isolated job root |
-| `CONVERTBOX_REDIS_URL` | empty | Redis URL; required in `api` and `worker` modes |
-| `CONVERTBOX_REDIS_QUEUE` | `convertbox:jobs` | Redis queue key prefix |
+| `CONVERTBOX_REDIS_URL` | empty | Redis URL; required in `api`, `worker`, and `pdf-worker` modes |
+| `CONVERTBOX_REDIS_QUEUE` | `convertbox:jobs` | Redis queue key prefix for every job except PDF input |
+| `CONVERTBOX_REDIS_PDF_QUEUE` | `convertbox:jobs:pdf` | Redis queue key for PDF input jobs, drained only by `pdf-worker` |
 | `CONVERTBOX_MAX_MB` | `25` | Per-upload limit |
 | `CONVERTBOX_WORKERS` | `2` | Concurrent conversions |
 | `CONVERTBOX_QUEUE_SIZE` | `20` | Bounded waiting queue |
@@ -111,14 +112,23 @@ curl -F file=@report.xlsx -F outputFormat=pdf -F pdfMode=optimized \
 - Per-IP token-bucket rate limiting and a concurrent-job quota bound submission abuse from a single client; the client IP is read from the raw TCP connection, not from forwardable headers like `X-Forwarded-For`.
 - Cleanup verifies that targets are descendants of the converter root and refuses symlink job directories. Old orphan directories are removed after restart.
 - Job state is persisted to a `job.json` sidecar per job so status/downloads survive a restart. Jobs still in flight at shutdown are recovered as failed rather than silently resumed.
-- Split mode passes only opaque job UUIDs through Redis. API and worker share the isolated job volume; Redis keeps unacknowledged work in a processing list so a single restarted worker service can requeue it.
+- Split mode passes only opaque job UUIDs through Redis. API, worker, and pdf-worker share the isolated job volume; each of the two separate Redis queues keeps its own unacknowledged work in its own processing list so its single restarted worker service can requeue it.
+- PDF input is rendered by its own `pdf-worker` container off its own Redis queue (`CONVERTBOX_REDIS_PDF_QUEUE`), never the shared `worker` pool that handles every other conversion—see [PDF worker isolation](#pdf-worker-isolation).
 - Logs contain job ID, formats, size, worker, and errors—not user file contents.
 - Downloads use `nosniff`, attachment disposition, and an opaque content type.
 - Optional shared-secret `X-API-Key` gate (`CONVERTBOX_API_KEY`) on the whole API and `/metrics`, compared in constant time; disabled by default since a lone-user local instance has no one else to authenticate.
 
 This reduces risk; it does not make arbitrary hostile document processing safe. Keep conversion workers isolated from credentials and sensitive internal networks. The bundled worker is resource-limited but still shares a Redis network; a public multi-tenant service should give document conversion a dedicated, egress-denied sandbox/container and add malware scanning, rate limits, quotas, and abuse controls.
 
-The Redis recovery model currently assumes one worker service (which may run several configured worker goroutines). Do not scale the worker service to multiple replicas until per-worker leases and stale-claim recovery are implemented.
+The Redis recovery model currently assumes one instance each of the `worker` and `pdf-worker` services (each of which may run several configured worker goroutines via `CONVERTBOX_WORKERS`). Do not scale either service to multiple replicas until per-worker leases and stale-claim recovery are implemented—`requeueActive()` unconditionally moves everything left in a queue's own processing list back onto that queue on startup, so a second replica of the same service restarting would requeue jobs the first replica is still actively working on.
+
+## PDF worker isolation
+
+A hostile PDF exploiting a bug in poppler's `pdftoppm` (the native renderer PDF→image conversion shells out to) would compromise whatever process ran it. In split mode, that process is `pdf-worker`, a container that does nothing except dequeue and render PDF→image jobs off `CONVERTBOX_REDIS_PDF_QUEUE`—not `worker`, which never touches PDF input at all and instead handles every other conversion (Office/ODF/Markdown/HTML→PDF via LibreOffice, images, structured data). A job's input format decides which queue it's enqueued on (`api`'s job creation), which decides which worker service ever sees it; the split is enforced in code, not by convention. `pdf-worker` also gets a lighter resource envelope than `worker` in the bundled `compose.yaml`, since it never has to run memory-hungry LibreOffice.
+
+This is queue/process isolation, not a sandbox: `pdf-worker` still runs as the same non-root user, with the same read-only root filesystem and dropped capabilities as every other application container, sharing the same job volume and Redis network. A compromised `pdf-worker` could still read/write other jobs' files on that shared volume or reach Redis and the rest of the Docker network. Real blast-radius containment beyond that—network egress denial, a separate volume or storage credential, gVisor/Kata-style sandboxing—remains follow-up hardening; see [ROADMAP.md](ROADMAP.md).
+
+`standalone` mode (no Redis, a single process) has no separate worker services to isolate PDF rendering into, so this split doesn't apply there—everything, PDF included, runs through the one local in-process queue, same as before this feature existed.
 
 ## Deploying beyond localhost
 
