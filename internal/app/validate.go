@@ -639,9 +639,12 @@ func validateODF(format, path string) error {
 
 // validateODFResourceReferences scans f (content.xml or styles.xml) for
 // every xlink:href attribute, on any element, and rejects it per
-// validateODFResourceHref unless the enclosing element is a text:a or
-// draw:a hyperlink. Uses a streaming xml.Decoder rather than pattern-
-// matching the raw bytes for the same reason validateHTMLForPDF does:
+// validateODFResourceHref unless it's a text:a or draw:a element's own
+// href—not any href found anywhere inside one, which would wrongly
+// exempt an inner draw:image's real resource reference just because it
+// happens to sit inside a hyperlinked frame. Uses a streaming xml.Decoder
+// rather than pattern-matching the raw bytes for the same reason
+// validateHTMLForPDF does:
 // encoding/xml decodes character references in attribute values the same
 // way a real XML consumer (LibreOffice's included) would, so a check
 // against attr.Value here can't be bypassed by an encoded scheme the way
@@ -656,7 +659,6 @@ func validateODFResourceReferences(f *zip.File, packageEntries map[string]bool) 
 	}
 	defer r.Close()
 	dec := xml.NewDecoder(io.LimitReader(r, maxZIPPackageUncompressedSize))
-	hyperlinkDepth := 0
 	for {
 		tok, err := dec.Token()
 		if err == io.EOF {
@@ -665,26 +667,29 @@ func validateODFResourceReferences(f *zip.File, packageEntries map[string]bool) 
 		if err != nil {
 			return errors.New("invalid ODF document part XML")
 		}
-		switch el := tok.(type) {
-		case xml.StartElement:
-			isHyperlink := (el.Name.Space == odfTextNS || el.Name.Space == odfDrawNS) && el.Name.Local == "a"
-			if isHyperlink {
-				hyperlinkDepth++
-			}
-			if hyperlinkDepth > 0 {
+		el, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		// The hyperlink exemption applies only to THIS element's own href
+		// (the link target, never fetched)—not to its descendants. A
+		// draw:a can wrap a draw:frame/draw:image (an image that's also a
+		// clickable link), and that inner image's href is a real resource
+		// reference LibreOffice fetches during rendering regardless of the
+		// hyperlink wrapper around it (temuan review P1: a previous
+		// version tracked hyperlink-ness as a subtree flag that stayed set
+		// for every descendant until the closing tag, which skipped
+		// checking exactly that inner reference).
+		isHyperlink := (el.Name.Space == odfTextNS || el.Name.Space == odfDrawNS) && el.Name.Local == "a"
+		for _, attr := range el.Attr {
+			if attr.Name.Space != odfXLinkNS || attr.Name.Local != "href" {
 				continue
 			}
-			for _, attr := range el.Attr {
-				if attr.Name.Space != odfXLinkNS || attr.Name.Local != "href" {
-					continue
-				}
-				if err := validateODFResourceHref(attr.Value, packageEntries); err != nil {
-					return err
-				}
+			if isHyperlink {
+				continue
 			}
-		case xml.EndElement:
-			if hyperlinkDepth > 0 && (el.Name.Space == odfTextNS || el.Name.Space == odfDrawNS) && el.Name.Local == "a" {
-				hyperlinkDepth--
+			if err := validateODFResourceHref(attr.Value, packageEntries); err != nil {
+				return err
 			}
 		}
 	}
@@ -698,6 +703,15 @@ func validateODFResourceReferences(f *zip.File, packageEntries map[string]bool) 
 // validateODF's doc comment for why this is a default-deny allowlist
 // against the package's own real contents rather than a denylist of
 // external URL schemes.
+//
+// The match is done against u.Path, url.Parse's already percent-decoded
+// form, not the raw href text: an href referencing a package entry whose
+// name has a space or other reserved character in it (e.g.
+// "Pictures/my%20photo.png" pointing at the real entry "Pictures/my
+// photo.png") is an entirely ordinary, spec-legal URI encoding an author's
+// own tooling produces—not an attack—and packageEntries holds the actual,
+// unencoded ZIP entry names, so comparing against the still-encoded href
+// would reject a legitimate reference to a real asset (temuan review P2).
 func validateODFResourceHref(href string, packageEntries map[string]bool) error {
 	if href == "" || strings.HasPrefix(href, "#") {
 		return nil
@@ -706,8 +720,9 @@ func validateODFResourceHref(href string, packageEntries map[string]bool) error 
 	if err != nil || u.IsAbs() || u.Host != "" || u.Scheme != "" {
 		return errors.New("ODF external resource references are not accepted")
 	}
-	clean := filepath.ToSlash(filepath.Clean(href))
-	if strings.HasPrefix(href, "/") || clean == ".." || strings.HasPrefix(clean, "../") {
+	decoded := u.Path
+	clean := filepath.ToSlash(filepath.Clean(decoded))
+	if strings.HasPrefix(decoded, "/") || clean == ".." || strings.HasPrefix(clean, "../") {
 		return errors.New("ODF resource references outside the package are not accepted")
 	}
 	if !packageEntries[clean] {

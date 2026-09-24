@@ -139,6 +139,40 @@ func TestValidateODFAcceptsResourceReferenceInPackage(t *testing.T) {
 	}
 }
 
+// TestValidateODFRejectsResourceInsideHyperlink proves the hyperlink
+// exemption in validateODFResourceReferences applies only to a text:a/
+// draw:a element's OWN href, not to every href found anywhere inside one:
+// a draw:a can wrap a draw:frame/draw:image (an image that's also a
+// clickable link), and that inner image's href is a real resource
+// LibreOffice fetches during rendering regardless of the hyperlink
+// wrapper around it (temuan review P1: an earlier version tracked
+// hyperlink-ness as a subtree flag that stayed set for every descendant
+// until the closing tag, which wrongly let this exact case through).
+func TestValidateODFRejectsResourceInsideHyperlink(t *testing.T) {
+	nestedInHyperlink := `<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:text><draw:a xlink:href="https://example.test/"><draw:frame><draw:image xlink:href="http://127.0.0.1:8080/probe.png"/></draw:frame></draw:a></office:text></office:body></office:document-content>`
+	path := writeODFFixture(t, "odt", map[string]string{"content.xml": nestedInHyperlink})
+	if _, err := validateUpload(path, "document.odt"); err == nil {
+		t.Fatal("expected the external image nested inside a hyperlink to still be rejected")
+	}
+}
+
+// TestValidateODFAcceptsPercentEncodedPackageReference proves a
+// percent-encoded href (ordinary, spec-legal URI encoding for a package
+// entry name containing a space or other reserved character—not an
+// attack) is matched against the actual, decoded ZIP entry name rather
+// than rejected outright for not matching the still-encoded text (temuan
+// review P2).
+func TestValidateODFAcceptsPercentEncodedPackageReference(t *testing.T) {
+	encodedRef := `<?xml version="1.0" encoding="UTF-8"?><office:document-content xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0" xmlns:xlink="http://www.w3.org/1999/xlink"><office:body><office:text><draw:image xlink:href="Pictures/my%20photo.png"/></office:text></office:body></office:document-content>`
+	path := writeODFFixture(t, "odt", map[string]string{
+		"content.xml":           encodedRef,
+		"Pictures/my photo.png": "not a real png but that's fine, validateODF doesn't decode it",
+	})
+	if _, err := validateUpload(path, "document.odt"); err != nil {
+		t.Fatalf("expected a percent-encoded reference to a real package entry to be accepted: %v", err)
+	}
+}
+
 func TestODFCapabilitiesDependOnLibreOffice(t *testing.T) {
 	c := &converter{}
 	if c.supports("odt", "pdf") {
