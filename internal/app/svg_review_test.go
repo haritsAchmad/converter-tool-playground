@@ -140,6 +140,16 @@ func TestConvertSVGCanvasFollowsViewport(t *testing.T) {
 			w:    192, h: 96,
 		},
 		{
+			// Review of 124e4f4: without a viewBox, oksvg's fallback
+			// ViewBox ("144pt" -> 144) was treated as explicit, so the
+			// 10x10 rect grew to ~13x13 on the 192x96 canvas.
+			name: "no viewBox draws user units unscaled",
+			svg:  `<svg xmlns="http://www.w3.org/2000/svg" width="144pt" height="72pt"><rect width="10" height="10" ` + red + `/></svg>`,
+			w:    192, h: 96,
+			redAt:   []image.Point{{5, 5}, {9, 9}},
+			clearAt: []image.Point{{12, 5}, {5, 12}},
+		},
+		{
 			name: "percentages fall back to viewBox",
 			svg:  `<svg xmlns="http://www.w3.org/2000/svg" width="100%" height="100%" viewBox="0 0 20 10"><rect width="20" height="10" ` + red + `/></svg>`,
 			w:    20, h: 10,

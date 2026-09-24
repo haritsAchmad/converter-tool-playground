@@ -1044,13 +1044,15 @@ func convertSVG(ctx context.Context, out, inPath, outPath string) (err error) {
 	// individually by maxImageDecodedPixels first guarantees w and h are
 	// both small enough (<=1e8) that int64(w)*int64(h) below (<=1e16)
 	// can never overflow int64 (max ~9.2e18) regardless of aspect ratio.
-	vb := icon.ViewBox
-	if root.viewBox[2] > 0 && root.viewBox[3] > 0 {
-		// oksvg stops reading the root's attributes at the first one it
-		// cannot parse, so width="100%" listed before viewBox loses the
-		// viewBox entirely; the independently parsed one wins.
-		vb.X, vb.Y, vb.W, vb.H = root.viewBox[0], root.viewBox[1], root.viewBox[2], root.viewBox[3]
-	}
+	// Only an explicit, valid viewBox attribute maps user space onto the
+	// canvas. icon.ViewBox is deliberately not used: oksvg fills it from
+	// width/height when there is no viewBox (with its own unit handling,
+	// "144pt" -> 144), which made a viewBox-less SVG pick up a spurious
+	// 192/144 scale (temuan review P2); and it stops reading root
+	// attributes at the first unparseable one, so width="100%" listed
+	// before viewBox loses the viewBox entirely. Without a viewBox, SVG
+	// user units are CSS pixels, so shapes are drawn unscaled.
+	vb := struct{ X, Y, W, H float64 }{root.viewBox[0], root.viewBox[1], root.viewBox[2], root.viewBox[3]}
 	hasViewBox := vb.W > 0 && vb.H > 0
 	cw, ch := svgCanvasSize(root.width, root.height, vb.W, vb.H)
 	declared := cw > 0 && ch > 0
