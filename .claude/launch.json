@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "convertbox",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/convertbox"],
+      "port": 8080
+    }
+  ]
+}
