@@ -21,6 +21,10 @@ services:
       - /tmp:size=16m
     security_opt: ["no-new-privileges:true"]
     cap_drop: ["ALL"]
+    # Only ever needs to be reachable from api/worker/pdf-worker, all on
+    # this same egress-denied network--see the `backend` network's own
+    # comment below.
+    networks: ["backend"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -60,6 +64,14 @@ services:
       interval: 30s
       timeout: 3s
       retries: 3
+    # Stays on the normal `default` network too (unlike worker/pdf-worker),
+    # since it has to keep being reachable on its published port--`backend`
+    # is only added so it can reach `redis` to enqueue jobs. Publishing a
+    # port still works on a multi-homed container; it just doesn't route
+    # out over the `internal: true` network specifically. api never runs
+    # an external tool against untrusted file content itself (workers do),
+    # so it isn't part of the egress-denial goal `backend` exists for.
+    networks: ["default", "backend"]
 
   worker:
     build: .
@@ -87,6 +99,17 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # Egress-denied: `backend` is an `internal: true` network, so this
+    # container gets no default gateway at all and can't reach the
+    # internet or the rest of the LAN--only redis, its one real network
+    # dependency, on that same network. This is the actual blast-radius
+    # containment the "PDF worker isolation" section and pdf-worker's own
+    # split queue only got partway to on their own: a compromised
+    # LibreOffice/ImageMagick/ffmpeg process here (all run against
+    # untrusted uploaded content) has nowhere to make an outbound
+    # connection to at all, closing off SSRF/exfiltration regardless of
+    # what a future bug in any of those tools might otherwise allow.
+    networks: ["backend"]
 
   # Runs PDF->image jobs only, off their own Redis queue, so a hostile PDF
   # that ever finds a bug in poppler's pdftoppm compromises this container
@@ -121,6 +144,10 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    # Egress-denied for the same reason as worker--see its own comment
+    # above. pdftoppm is the one running against untrusted uploaded PDFs
+    # here.
+    networks: ["backend"]
 
   # Optional TLS-terminating reverse proxy for exposing `api` beyond
   # localhost. Off by default; enable with `docker compose --profile proxy up`.
@@ -146,6 +173,21 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+
+networks:
+  # api still gets the automatic `default` network Compose would create
+  # anyway (it doesn't declare `networks:` for that reason on any service
+  # here except api, which explicitly re-lists it since declaring
+  # `networks:` at all opts a service out of the implicit default
+  # attachment). `backend` is the actual egress-denial mechanism: an
+  # `internal: true` network gets no default gateway and can't expose
+  # ports, so redis/worker/pdf-worker--everything that either holds queue
+  # data or runs an external tool against untrusted uploaded content--has
+  # no route to the internet or the rest of the LAN at all, only to each
+  # other. Verified against Docker's own compose-file network reference
+  # rather than assumed.
+  backend:
+    internal: true
 
 volumes:
   jobs:

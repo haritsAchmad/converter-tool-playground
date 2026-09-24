@@ -34,6 +34,21 @@ import (
 
 var blockedExt = map[string]bool{".exe": true, ".dll": true, ".com": true, ".bat": true, ".cmd": true, ".ps1": true, ".sh": true, ".php": true, ".js": true, ".jar": true, ".msi": true, ".scr": true, ".vbs": true, ".py": true, ".pl": true}
 
+// init disables pdfcpu's own on-disk config directory (~/.config/pdfcpu by
+// default) before any pdfcpu call in this package or convert.go can run.
+// Left enabled, pdfcpu tries to create that directory (and its user font
+// dir) on first use—which panics with "read-only file system" under this
+// project's own read_only: true container hardening (api/worker/
+// pdf-worker in compose.yaml), a real bug only surfaced by actually
+// running the Docker stack rather than just validating compose.yaml's
+// syntax. This codebase only ever uses pdfcpu for structural validation,
+// PDF page rendering/wrapping, and image->PDF import—none of which need
+// pdfcpu's own config file or custom user fonts—so disabling it outright
+// has no functional downside here.
+func init() {
+	api.DisableConfigDir()
+}
+
 func validateUpload(path, original string) (string, error) {
 	ext := strings.ToLower(filepath.Ext(original))
 	if hasBlockedExtension(original) {
