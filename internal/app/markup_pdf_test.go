@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -38,6 +39,21 @@ func TestSupportsMarkdownAndHTMLToPDF(t *testing.T) {
 // filesystem path, not just an external http(s) URL—while an ordinary
 // <a href> hyperlink and a data: URI are left alone.
 func TestValidateHTMLForPDF(t *testing.T) {
+	validPNGDataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tinyPNG(t, 2, 2))
+	// A PNG header alone (no pixel data needed—see pngHeader/convert_test.go)
+	// declaring dimensions far past maxImageDecodedPixels.
+	oversizedPNGDataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString(pngHeader(t, 40000, 40000))
+	mismatchedMimeDataURI := "data:image/png;base64," + base64.StdEncoding.EncodeToString([]byte("not actually a png"))
+	// temuan review P1, round 3: a data: URI whose declared media type
+	// isn't a raster image at all. text/css is the concrete exploit—its
+	// decoded content is parsed by LibreOffice as an ordinary stylesheet,
+	// exactly like a <style> block, so a nested external url() inside it
+	// reaches LibreOffice's fetch path the same as if it had been written
+	// directly in the HTML, unless the data: URI itself is rejected before
+	// ever being decoded.
+	cssDataURI := "data:text/css;base64," + base64.StdEncoding.EncodeToString([]byte("body{background:url(http://127.0.0.1:8080/probe.png)}"))
+	svgDataURI := "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString([]byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>`))
+
 	cases := []struct {
 		name    string
 		html    string
@@ -46,7 +62,12 @@ func TestValidateHTMLForPDF(t *testing.T) {
 		{"plain paragraph", `<p>Hello <em>world</em></p>`, false},
 		{"hyperlink to external site", `<p><a href="https://example.com">link</a></p>`, false},
 		{"hyperlink to local path", `<p><a href="../other-job/output.png">link</a></p>`, false},
-		{"data URI image", `<img src="data:image/png;base64,aGVsbG8=">`, false},
+		{"valid PNG data URI image", `<img src="` + validPNGDataURI + `">`, false},
+		{"oversized PNG data URI image (decompression bomb)", `<img src="` + oversizedPNGDataURI + `">`, true},
+		{"data URI declaring image/png with non-PNG bytes", `<img src="` + mismatchedMimeDataURI + `">`, true},
+		{"data URI stylesheet with a nested external url()", `<link rel="stylesheet" href="` + cssDataURI + `">`, true},
+		{"data URI SVG with an embedded script", `<img src="` + svgDataURI + `">`, true},
+		{"non-base64 data URI", `<img src="data:image/png,not-base64-encoded">`, true},
 		{"script tag", `<script>alert(1)</script>`, true},
 		{"iframe tag", `<iframe src="https://example.com"></iframe>`, true},
 		{"object tag", `<object data="https://example.com/x.swf"></object>`, true},

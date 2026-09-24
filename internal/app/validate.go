@@ -3,11 +3,13 @@ package app
 import (
 	"archive/zip"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"image"
+	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
@@ -303,12 +305,85 @@ func validateHTMLForPDF(htmlBytes []byte) error {
 }
 
 // isSafeResourceRef reports whether a resource reference is empty (no
-// reference at all) or an inline data: URI—the only kind
-// validateHTMLForPDF accepts. See its doc comment for why every other
-// form, including a same-directory relative path, is rejected.
+// reference at all) or an inline data: URI carrying one of a closed set of
+// raster image formats (see isSafeDataURI)—the only kind validateHTMLForPDF
+// accepts. See its doc comment for why every other form, including a
+// same-directory relative path, is rejected.
 func isSafeResourceRef(val string) bool {
 	val = strings.TrimSpace(val)
-	return val == "" || strings.HasPrefix(strings.ToLower(val), "data:")
+	return val == "" || isSafeDataURI(val)
+}
+
+// dataURIImageSignatures is the closed set of raster image formats
+// accepted for an inline data: URI resource reference. Each is checked
+// against the actual decoded bytes' own magic signature, not just the
+// data: URI's self-declared media-type parameter, which is attacker-
+// controlled and proves nothing on its own—the declared type is only used
+// to pick which signature (and image.DecodeConfig format) applies, never
+// trusted on its own to decide accept/reject.
+//
+// Deliberately excludes text/css and image/svg+xml (and everything else):
+// both can themselves carry further resource references—a nested CSS
+// url(...), an SVG <image>/<script>—that this validator has no visibility
+// into once they're inside a data: payload it doesn't recursively inspect.
+// A data:text/css;base64,... stylesheet used to pass an earlier,
+// any-data:-URI-is-fine version of this check outright, while its decoded
+// content—parsed by LibreOffice as an ordinary stylesheet exactly like a
+// <style> block—could still carry an external url() reference this
+// validator never looked at (temuan review P1, round 3). WebP is excluded
+// too: this codebase has no Go-native WebP decoder (image conversion
+// shells out to ImageMagick instead), so its dimensions can't be bounded
+// the same way the other three are below—the same reason validateUpload's
+// own decompression-bomb check already skips WebP today.
+var dataURIImageSignatures = []struct {
+	mime string
+	sig  func([]byte) bool
+}{
+	{"image/png", func(b []byte) bool { return bytes.HasPrefix(b, []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}) }},
+	{"image/jpeg", func(b []byte) bool { return len(b) >= 3 && b[0] == 0xff && b[1] == 0xd8 && b[2] == 0xff }},
+	{"image/gif", func(b []byte) bool { return bytes.HasPrefix(b, []byte("GIF87a")) || bytes.HasPrefix(b, []byte("GIF89a")) }},
+}
+
+// isSafeDataURI parses a data: URI (RFC 2397: "data:[<mediatype>][;base64],<data>")
+// and accepts it only when the media type is one of dataURIImageSignatures,
+// the payload is base64-encoded (a non-base64, percent-encoded text
+// payload is rejected outright rather than decoded and re-scanned—none of
+// the allowed binary image formats is sensibly represented that way), the
+// decoded bytes actually match that format's signature, and the decoded
+// image's declared dimensions stay within maxImageDecodedPixels—the exact
+// same decompression-bomb guard validateUpload already applies to an
+// ordinary PNG/JPEG upload, reused here since LibreOffice decodes this
+// data the same way while rendering the PDF.
+func isSafeDataURI(val string) bool {
+	if !strings.HasPrefix(strings.ToLower(val), "data:") {
+		return false
+	}
+	meta, payload, found := strings.Cut(val[len("data:"):], ",")
+	if !found {
+		return false
+	}
+	metaLower := strings.ToLower(meta)
+	if !strings.HasSuffix(metaLower, ";base64") {
+		return false
+	}
+	mime := strings.TrimSuffix(metaLower, ";base64")
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		if decoded, err = base64.RawStdEncoding.DecodeString(payload); err != nil {
+			return false
+		}
+	}
+	for _, candidate := range dataURIImageSignatures {
+		if mime != candidate.mime || !candidate.sig(decoded) {
+			continue
+		}
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(decoded))
+		if err != nil {
+			return false
+		}
+		return cfg.Width > 0 && cfg.Height > 0 && int64(cfg.Width)*int64(cfg.Height) <= maxImageDecodedPixels
+	}
+	return false
 }
 
 // validateCSSForPDF applies the same data:-only policy to every CSS

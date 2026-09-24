@@ -312,7 +312,14 @@ func (c *converter) convertOffice(ctx context.Context, in, pdfMode, inPath, outP
 // real on-disk location and a job's per-job working directory is not a
 // sandbox. That's the same SSRF/local-file-read-shaped risk already
 // flagged for FFmpeg's network-capable input protocols on the roadmap,
-// just reached through a document instead of a filename. It's a
+// just reached through a document instead of a filename. The accepted
+// data: URIs are themselves a closed allowlist of raster image formats,
+// cross-checked against their actual decoded bytes and bounded to the
+// same declared-dimension ceiling an ordinary image upload already gets,
+// not "any data: URI"—a data:text/css payload, say, decodes to a
+// stylesheet LibreOffice parses exactly like a <style> block, so its own
+// content still needs the same reference check applied recursively, and
+// a data:image/svg+xml payload can embed a <script> of its own. It's a
 // default-deny allowlist for resource references, parsed and checked
 // against the same decoded attribute values LibreOffice's own parser would
 // act on (not pattern-matched against the raw, possibly HTML-entity-
