@@ -420,12 +420,17 @@ func renderedPDFPages(root, ext string) ([]renderedPDFPage, error) {
 }
 
 // zipRenderedPages packages every rendered page into outPath. It checks ctx
-// before each page instead of only relying on pdftoppm's own ctx-bound
-// process exiting: without this, cancelling or timing out a job only
-// stopped pdftoppm, while the zip loop kept copying however many hundreds
-// of already-rendered pages remained (temuan review P2), holding the
-// worker past its deadline and risking a job that still gets reported
-// successful after it should have been killed.
+// before each page and, via copyIntoZip's contextReader, between chunks
+// within a page's own copy too—not just relying on pdftoppm's own ctx-bound
+// process exiting. Without the per-page check, cancelling or timing out a
+// job only stopped pdftoppm while the zip loop kept copying however many
+// hundreds of already-rendered pages remained; without the per-chunk check,
+// a cancellation arriving mid-copy of whichever page was in flight (e.g. the
+// last, or the only, page) still let that copyIntoZip call run to
+// completion and report success (temuan review P2, both rounds). A last
+// ctx check after zw.Close() covers a cancellation landing during
+// finalization (flushing the central directory) after every page already
+// copied cleanly.
 func zipRenderedPages(ctx context.Context, outPath string, pages []renderedPDFPage, ext string) (err error) {
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -437,23 +442,23 @@ func zipRenderedPages(ctx context.Context, outPath string, pages []renderedPDFPa
 		}
 	}()
 	zw := zip.NewWriter(f)
-	defer func() {
-		if closeErr := zw.Close(); err == nil {
-			err = closeErr
-		}
-	}()
 	for _, p := range pages {
 		if err = ctx.Err(); err != nil {
+			_ = zw.Close()
 			return err
 		}
-		if err = copyIntoZip(zw, p, ext); err != nil {
+		if err = copyIntoZip(ctx, zw, p, ext); err != nil {
+			_ = zw.Close()
 			return err
 		}
 	}
-	return nil
+	if err = zw.Close(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
-func copyIntoZip(zw *zip.Writer, p renderedPDFPage, ext string) error {
+func copyIntoZip(ctx context.Context, zw *zip.Writer, p renderedPDFPage, ext string) error {
 	src, err := os.Open(p.path)
 	if err != nil {
 		return err
@@ -463,8 +468,32 @@ func copyIntoZip(zw *zip.Writer, p renderedPDFPage, ext string) error {
 	if err != nil {
 		return err
 	}
-	_, err = io.Copy(w, src)
+	return copyWithContext(ctx, w, src)
+}
+
+// copyWithContext is io.Copy with a per-chunk ctx check via contextReader,
+// factored out of copyIntoZip so the cancelled-mid-copy case can be tested
+// deterministically against a controllable reader instead of a real file
+// and real timing.
+func copyWithContext(ctx context.Context, dst io.Writer, src io.Reader) error {
+	_, err := io.Copy(dst, contextReader{ctx: ctx, r: src})
 	return err
+}
+
+// contextReader aborts a Read once ctx is done, so io.Copy checks
+// cancellation between chunks instead of only before or after a whole
+// page's copy—a cancelled job stops mid-copy of whichever page is in
+// flight rather than finishing it regardless.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (cr contextReader) Read(p []byte) (int, error) {
+	if err := cr.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return cr.r.Read(p)
 }
 
 func convertDocument(in, out, inPath, outPath string) error {

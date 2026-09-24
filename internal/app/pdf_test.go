@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -266,6 +267,71 @@ func TestZipRenderedPagesStopsOnCancelledContext(t *testing.T) {
 	names := zipEntryNames(t, outPath)
 	if len(names) != 0 {
 		t.Fatalf("expected no pages copied after cancellation, got %v", names)
+	}
+}
+
+// blockAfterFirstChunkReader hands out one fixed chunk, then signals
+// started and blocks on unblock before returning it—so a test can
+// synchronously cancel a context while a copy is provably in progress,
+// instead of racing a cancellation against real file I/O and real time.
+type blockAfterFirstChunkReader struct {
+	first   []byte
+	sent    bool
+	started chan struct{}
+	unblock chan struct{}
+}
+
+func (r *blockAfterFirstChunkReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	n := copy(p, r.first)
+	close(r.started)
+	<-r.unblock
+	return n, nil
+}
+
+// TestCopyWithContextStopsMidStreamWhenCancelled proves the exact mechanism
+// copyIntoZip relies on: io.Copy over a contextReader stops as soon as ctx
+// is cancelled, even in the middle of a single page's own copy, instead of
+// letting that copy run to completion and report success. This covers the
+// case zipRenderedPages's per-PAGE ctx check (see
+// TestZipRenderedPagesStopsOnCancelledContext) cannot: a cancellation that
+// lands after a page's copy has already started—which for a single-page
+// PDF is the only page there is (temuan review P2, round 2). Deterministic
+// via a synchronizing reader rather than sleeping and hoping the timing
+// lines up against a real file.
+func TestCopyWithContextStopsMidStreamWhenCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	src := &blockAfterFirstChunkReader{first: bytes.Repeat([]byte("x"), 4096), started: make(chan struct{}), unblock: make(chan struct{})}
+	var buf bytes.Buffer
+	done := make(chan error, 1)
+	go func() {
+		done <- copyWithContext(ctx, &buf, src)
+	}()
+	<-src.started
+	cancel()
+	close(src.unblock)
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled once cancelled mid-copy, got %v (copied %d bytes)", err, buf.Len())
+	}
+}
+
+// TestZipRenderedPagesChecksContextAfterFinalization proves the ctx check
+// after zw.Close() (see zipRenderedPages) actually runs and is honored: with
+// no pages, the per-page loop never executes, so the only way a cancelled
+// context can surface is that trailing check. Without it, an empty (or
+// fully-copied) archive whose cancellation arrived only after the last page
+// finished would still be reported as a success.
+func TestZipRenderedPagesChecksContextAfterFinalization(t *testing.T) {
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	outPath := filepath.Join(dir, "out.zip")
+	err := zipRenderedPages(ctx, outPath, nil, "png")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled from the post-finalization check, got %v", err)
 	}
 }
 
