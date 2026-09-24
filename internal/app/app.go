@@ -197,6 +197,11 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "unsupported input/output format pair")
 		return
 	}
+	pdfMode, err := resolvePDFMode(in, out, fields["pdfMode"])
+	if err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
 	base := sanitizeBase(fields["outputName"])
 	if base == "" {
 		base = strings.TrimSuffix(original, filepath.Ext(original))
@@ -205,14 +210,14 @@ func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
 	if base == "" {
 		base = "converted"
 	}
-	ext := formats[out].Extensions[0]
+	ext := outputExtension(in, out)
 	outPath := filepath.Join(jobDir, "output"+ext)
 	if !within(jobDir, inputPath) || !within(jobDir, outPath) {
 		writeError(w, 400, "unsafe path")
 		return
 	}
 	now := time.Now().UTC()
-	j := &Job{ID: id, Status: Queued, InputFormat: in, OutputFormat: out, OriginalName: original, OutputName: base + ext, Size: size, CreatedAt: now, ExpiresAt: now.Add(a.cfg.JobTTL), InputPath: inputPath, OutputPath: outPath, ClientIP: ip, mu: &sync.RWMutex{}}
+	j := &Job{ID: id, Status: Queued, InputFormat: in, OutputFormat: out, OriginalName: original, OutputName: base + ext, PDFMode: pdfMode, Size: size, CreatedAt: now, ExpiresAt: now.Add(a.cfg.JobTTL), InputPath: inputPath, OutputPath: outPath, ClientIP: ip, mu: &sync.RWMutex{}}
 	a.store.add(j)
 	if err := a.store.persist(j); err != nil {
 		a.log.Warn("failed to persist job state", "job_id", j.ID, "error", err)
@@ -356,7 +361,7 @@ func (a *App) process(index int, j *Job) bool {
 	_ = os.Remove(j.OutputPath)
 	ctx, cancel := context.WithTimeout(a.ctx, a.cfg.JobTimeout)
 	defer cancel()
-	err := a.converter.run(ctx, j.InputFormat, j.OutputFormat, j.InputPath, j.OutputPath)
+	err := a.converter.run(ctx, j.InputFormat, j.OutputFormat, j.PDFMode, j.InputPath, j.OutputPath)
 	now := time.Now().UTC()
 	j.update(func(x *Job) {
 		x.FinishedAt = &now

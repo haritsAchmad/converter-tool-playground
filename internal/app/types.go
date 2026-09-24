@@ -15,21 +15,24 @@ const (
 )
 
 type Job struct {
-	ID           string     `json:"id"`
-	Status       Status     `json:"status"`
-	InputFormat  string     `json:"inputFormat"`
-	OutputFormat string     `json:"outputFormat"`
-	OriginalName string     `json:"originalName"`
-	OutputName   string     `json:"outputName,omitempty"`
-	Size         int64      `json:"size"`
-	CreatedAt    time.Time  `json:"createdAt"`
-	FinishedAt   *time.Time `json:"finishedAt,omitempty"`
-	ExpiresAt    time.Time  `json:"expiresAt"`
-	Error        string     `json:"error,omitempty"`
-	InputPath    string     `json:"-"`
-	OutputPath   string     `json:"-"`
-	ClientIP     string     `json:"-"`
-	mu           *sync.RWMutex
+	ID           string `json:"id"`
+	Status       Status `json:"status"`
+	InputFormat  string `json:"inputFormat"`
+	OutputFormat string `json:"outputFormat"`
+	OriginalName string `json:"originalName"`
+	OutputName   string `json:"outputName,omitempty"`
+	// PDFMode is "standard" or "optimized", set only for Office->PDF jobs
+	// (see convertOffice); empty for every other conversion pair.
+	PDFMode    string     `json:"pdfMode,omitempty"`
+	Size       int64      `json:"size"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+	ExpiresAt  time.Time  `json:"expiresAt"`
+	Error      string     `json:"error,omitempty"`
+	InputPath  string     `json:"-"`
+	OutputPath string     `json:"-"`
+	ClientIP   string     `json:"-"`
+	mu         *sync.RWMutex
 }
 
 func (j *Job) snapshot() Job {

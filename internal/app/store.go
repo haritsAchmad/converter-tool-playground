@@ -138,15 +138,25 @@ func (s *store) reload(id string) (*Job, bool) {
 		return nil, false
 	}
 	loaded.InputPath = filepath.Join(dir, "input.bin")
-	format, ok := formats[loaded.OutputFormat]
-	if !ok || len(format.Extensions) == 0 {
+	ext := outputExtension(loaded.InputFormat, loaded.OutputFormat)
+	if ext == "" {
 		return nil, false
 	}
-	ext := format.Extensions[0]
-	if !strings.HasSuffix(strings.ToLower(loaded.OutputName), ext) {
-		return nil, false
+	name := strings.ToLower(loaded.OutputName)
+	matched := ext
+	if !strings.HasSuffix(name, ext) {
+		matched = ""
+		for _, legacy := range legacyOutputExtensions(loaded.InputFormat, loaded.OutputFormat) {
+			if strings.HasSuffix(name, legacy) {
+				matched = legacy
+				break
+			}
+		}
+		if matched == "" {
+			return nil, false
+		}
 	}
-	loaded.OutputPath = filepath.Join(dir, "output"+ext)
+	loaded.OutputPath = filepath.Join(dir, "output"+matched)
 	loaded.mu = &sync.RWMutex{}
 	if existing != nil {
 		loaded.ClientIP = existing.snapshot().ClientIP

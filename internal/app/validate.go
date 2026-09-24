@@ -82,8 +82,12 @@ func validateUpload(path, original string) (string, error) {
 		}
 	}
 	if imageFormats[candidate] && candidate != "webp" {
-		if _, _, err := image.DecodeConfig(bytes.NewReader(head)); err != nil {
+		cfg, _, err := image.DecodeConfig(bytes.NewReader(head))
+		if err != nil {
 			return "", errors.New("image header is invalid")
+		}
+		if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > maxImageDecodedPixels {
+			return "", errors.New("image dimensions exceed the safety limit")
 		}
 	}
 	if err := validateSyntax(candidate, path); err != nil {
@@ -151,6 +155,17 @@ func validateSyntax(format, path string) error {
 		if err := api.Validate(bytes.NewReader(b), model.NewDefaultConfiguration()); err != nil {
 			return fmt.Errorf("invalid PDF structure: %w", err)
 		}
+		// Bounded up front, before rendering: convertPDF renders every page
+		// into its own file and zips them, so an unbounded page count is an
+		// unbounded amount of disk and pdftoppm wall time, not just a bigger
+		// single image.
+		count, err := api.PageCount(bytes.NewReader(b), model.NewDefaultConfiguration())
+		if err != nil {
+			return fmt.Errorf("could not determine PDF page count: %w", err)
+		}
+		if count > maxPDFPages {
+			return fmt.Errorf("PDF has %d pages, exceeding the %d page rendering limit", count, maxPDFPages)
+		}
 	}
 	return nil
 }
@@ -158,6 +173,20 @@ func validateSyntax(format, path string) error {
 const (
 	maxOOXMLEntries          = 10000
 	maxOOXMLUncompressedSize = 200 << 20
+	// Declared width*height ceiling for PNG/JPEG input, checked against the
+	// header BEFORE the full pixel buffer is ever allocated (image.Decode in
+	// convertImage decodes unconditionally otherwise). 100 megapixels covers
+	// any legitimate photo or scan for this service while keeping a hostile
+	// file's worst-case decoded buffer in the hundreds-of-MB range instead of
+	// unbounded — a small PNG/JPEG can freely lie about its dimensions in the
+	// header (a classic "decompression bomb"), and the upload size limit
+	// alone doesn't constrain that.
+	maxImageDecodedPixels = 100_000_000
+	// Page count ceiling for PDF input, checked here (before conversion)
+	// and again passed to pdftoppm's -l flag as defense in depth. 300 pages
+	// comfortably covers a thesis or report while bounding convertPDF's
+	// worst case to 300 rendered files zipped into one output.
+	maxPDFPages = 300
 )
 
 func validateOOXML(format, path string) error {

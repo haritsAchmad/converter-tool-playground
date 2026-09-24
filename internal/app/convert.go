@@ -1,6 +1,7 @@
 package app
 
 import (
+	"archive/zip"
 	"bytes"
 	"context"
 	"encoding/csv"
@@ -16,10 +17,16 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 
 	md "github.com/JohannesKaufmann/html-to-markdown/v2"
+	"github.com/pdfcpu/pdfcpu/pkg/api"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
 	"github.com/yuin/goldmark"
 	"gopkg.in/yaml.v3"
 )
@@ -88,6 +95,11 @@ func (c *converter) supports(in, out string) bool {
 	if officeFormats[in] && out == "pdf" {
 		return c.libreoffice != ""
 	}
+	if imageFormats[in] && out == "pdf" {
+		// Pure Go via pdfcpu (already a dependency for PDF structural
+		// validation)—no external tool required, so always available.
+		return true
+	}
 	if imageFormats[in] && imageFormats[out] {
 		if in == "webp" || out == "webp" {
 			return c.magick != ""
@@ -97,7 +109,59 @@ func (c *converter) supports(in, out string) bool {
 	return false
 }
 
-func (c *converter) run(ctx context.Context, in, out, inPath, outPath string) error {
+// outputExtension is the file extension a job should be stored/downloaded
+// under for an in->out pair. Usually the target format's own registered
+// extension, except PDF->image, which always produces a ZIP of per-page
+// images (see convertPDF)—the target format token stays "png"/"jpeg" (the
+// same value the API/UI already offer), but the bytes on disk are an
+// archive, not a bare image, so the extension has to reflect that instead
+// of formats[out].Extensions[0].
+//
+// This is the SINGLE source of truth for that extension—store.reload()
+// also calls it (re-deriving the expected extension to validate the
+// on-disk job.json sidecar, since a split API/worker deployment treats
+// that shared file as untrusted-until-checked state). A second,
+// independently written copy of this rule previously existed there and
+// drifted the moment PDF->image stopped being a bare extension (temuan
+// review P1: reload() rejected every PDF->PNG/JPEG job outright, and the
+// worker silently dropped them from the queue without converting).
+// Returns "" for an out that isn't a registered format at all, rather than
+// panicking on formats[out].Extensions[0] against a zero-value Format—
+// reload() treats that the same as "job cannot be trusted", the same
+// safe-reject behavior its own prior format/ok, len(...) == 0 check had.
+func outputExtension(in, out string) string {
+	if in == "pdf" && imageFormats[out] {
+		return ".zip"
+	}
+	format, ok := formats[out]
+	if !ok || len(format.Extensions) == 0 {
+		return ""
+	}
+	return format.Extensions[0]
+}
+
+// legacyOutputExtensions returns extension(s) a job.json sidecar for in->out
+// might carry from BEFORE outputExtension's current answer for that pair,
+// so store.reload() can still find an already-finished job's output file
+// under its old name. The only pair whose convention has ever changed is
+// PDF->image: it used to write a bare image directly and now always writes
+// a ZIP of every page (see convertPDF)—a job that COMPLETED under the old
+// rule has a real "output.png"/"output.jpg" on disk that will never be
+// rewritten, so it must stay reachable via that name until it expires
+// (temuan review P2: making reload() strictly ZIP-only for this pair,
+// while fixing the P1 above, broke status/download for every PDF->image
+// job that had already finished before that fix shipped). Returns nil for
+// every other pair, which has only ever had one extension.
+func legacyOutputExtensions(in, out string) []string {
+	if in == "pdf" && imageFormats[out] {
+		if format, ok := formats[out]; ok && len(format.Extensions) > 0 {
+			return []string{format.Extensions[0]}
+		}
+	}
+	return nil
+}
+
+func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath string) error {
 	if !c.supports(in, out) {
 		return errors.New("conversion pair is not supported")
 	}
@@ -107,20 +171,98 @@ func (c *converter) run(ctx context.Context, in, out, inPath, outPath string) er
 	if in == "pdf" {
 		return c.convertPDF(ctx, out, inPath, outPath)
 	}
+	if imageFormats[in] && out == "pdf" {
+		return convertImageToPDF(inPath, outPath)
+	}
 	if imageFormats[in] {
 		return c.convertImage(ctx, in, out, inPath, outPath)
 	}
 	if officeFormats[in] {
-		return c.convertOffice(ctx, in, inPath, outPath)
+		return c.convertOffice(ctx, in, pdfMode, inPath, outPath)
 	}
 	return convertDocument(in, out, inPath, outPath)
+}
+
+// PDFModeStandard (the default, used whenever a job doesn't specify
+// pdfMode) leaves LibreOffice's export filter untouched: whatever page
+// setup, fonts, and image fidelity the source document's own styles
+// already specify come through as-is, same as opening File > Export As
+// PDF with no options changed.
+//
+// PDFModeOptimized opts into filter data (see officePDFFilterOptions) that
+// actively reshapes the export: every Calc sheet is forced onto exactly
+// one PDF page regardless of its own print setup (SinglePageSheets), the
+// 14 standard PDF fonts are embedded so viewers can't silently substitute
+// a different font than what LibreOffice rendered with (EmbedStandardFonts),
+// and embedded images are downsampled to a web-friendly 150 DPI
+// (ReduceImageResolution/MaxImageResolution) for a smaller file. This is a
+// deliberate, opt-in trade—layout may shift from what the source document
+// would print as—never the default, per the roadmap's "keep a fast
+// standard mode... rather than silently rewriting every document's
+// layout."
+const (
+	PDFModeStandard  = "standard"
+	PDFModeOptimized = "optimized"
+)
+
+// resolvePDFMode validates the optional pdfMode form field against the
+// resolved in/out pair. Blank stays blank for every pair except
+// Office->PDF, where it normalizes to PDFModeStandard so job status
+// reporting is explicit about which mode actually applied rather than
+// leaving it ambiguous between "not applicable" and "defaulted".
+func resolvePDFMode(in, out, raw string) (string, error) {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	applicable := officeFormats[in] && out == "pdf"
+	if raw != "" && !applicable {
+		return "", errors.New("pdfMode is only applicable when converting an Office document to PDF")
+	}
+	if !applicable {
+		return "", nil
+	}
+	if raw == "" {
+		raw = PDFModeStandard
+	}
+	if raw != PDFModeStandard && raw != PDFModeOptimized {
+		return "", fmt.Errorf("pdfMode must be %q or %q", PDFModeStandard, PDFModeOptimized)
+	}
+	return raw, nil
+}
+
+// officePDFFilterName maps a source Office format to the LibreOffice PDF
+// export filter that understands its format-specific options (verified
+// against LibreOffice's own filter registry: filter/source/config/
+// fragments/filters/{writer,calc,impress}_pdf_Export.xcu).
+var officePDFFilterName = map[string]string{
+	"docx": "writer_pdf_Export",
+	"xlsx": "calc_pdf_Export",
+	"pptx": "impress_pdf_Export",
+}
+
+// officePDFFilterOptions returns the --convert-to filter-data JSON object
+// (without the enclosing pdf:<filter>: prefix) for pdfMode, or "" for
+// PDFModeStandard/unknown values, meaning "pass no filter data at all"
+// (LibreOffice's own defaults). SinglePageSheets is Calc-only per its own
+// documented behavior ("ignores each sheet's paper size, print ranges and
+// shown/hidden status and puts every sheet on exactly one page"); the
+// font/image options are common to all three *_pdf_Export filters.
+func officePDFFilterOptions(in, pdfMode string) string {
+	if pdfMode != PDFModeOptimized {
+		return ""
+	}
+	opts := `"EmbedStandardFonts":{"type":"boolean","value":"true"},` +
+		`"ReduceImageResolution":{"type":"boolean","value":"true"},` +
+		`"MaxImageResolution":{"type":"long","value":"150"}`
+	if in == "xlsx" {
+		opts = `"SinglePageSheets":{"type":"boolean","value":"true"},` + opts
+	}
+	return "{" + opts + "}"
 }
 
 // convertOffice runs LibreOffice with a fresh per-job profile. The uploaded
 // file is staged with its verified extension because job storage deliberately
 // uses an opaque input.bin name and LibreOffice's filter detection is more
 // deterministic when the OOXML extension is present.
-func (c *converter) convertOffice(ctx context.Context, in, inPath, outPath string) error {
+func (c *converter) convertOffice(ctx context.Context, in, pdfMode, inPath, outPath string) error {
 	if c.libreoffice == "" {
 		return errors.New("Office conversion is not available")
 	}
@@ -141,10 +283,14 @@ func (c *converter) convertOffice(ctx context.Context, in, inPath, outPath strin
 		return err
 	}
 	profileURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(profile)}).String()
+	convertTo := "pdf"
+	if opts := officePDFFilterOptions(in, pdfMode); opts != "" {
+		convertTo = "pdf:" + officePDFFilterName[in] + ":" + opts
+	}
 	cmd := exec.CommandContext(ctx, c.libreoffice,
 		"--headless", "--invisible", "--nologo", "--nodefault", "--nolockcheck", "--norestore",
 		"-env:UserInstallation="+profileURL,
-		"--convert-to", "pdf", "--outdir", workDir, staged,
+		"--convert-to", convertTo, "--outdir", workDir, staged,
 	)
 	cmd.Dir = workDir
 	cmd.Env = officeEnvironment(c.libreoffice, workDir)
@@ -195,18 +341,24 @@ func copyPrivateFile(src, dst string) error {
 	return closeErr
 }
 
-// convertPDF renders only the first page of the PDF (a bounded, single-file
-// output keeps this a plain 1-job-1-output-file conversion like every other
-// format here) via poppler's pdftoppm: a mature, actively CVE-patched
-// renderer, run out-of-process with a job deadline so a hostile PDF can burn
-// at most that much wall time before it's killed.
+// convertPDF renders every page of the PDF (up to maxPDFPages—also enforced
+// at upload validation time, but repeated here via -l as defense in depth)
+// via poppler's pdftoppm: a mature, actively CVE-patched renderer, run
+// out-of-process with a job deadline so a hostile PDF can burn at most that
+// much wall time before it's killed. pdftoppm writes one file per page
+// (root-1.<ext>, root-2.<ext>, ...); those are zipped into a single
+// page-N.<ext> per entry output and then removed, keeping this a plain
+// 1-job-1-output-file conversion like every other format here even though
+// the source may have many pages.
 func (c *converter) convertPDF(ctx context.Context, out, inPath, outPath string) error {
 	if c.pdftoppm == "" {
 		return errors.New("PDF rendering is not available")
 	}
-	args := []string{"-f", "1", "-l", "1", "-r", "150", "-singlefile"}
+	ext := "png"
+	args := []string{"-r", "150", "-l", strconv.Itoa(maxPDFPages)}
 	if out == "jpeg" {
 		args = append(args, "-jpeg")
+		ext = "jpg"
 	} else {
 		args = append(args, "-png")
 	}
@@ -219,10 +371,90 @@ func (c *converter) convertPDF(ctx context.Context, out, inPath, outPath string)
 	if err != nil {
 		return fmt.Errorf("PDF rendering failed: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
-	if info, statErr := os.Stat(outPath); statErr != nil || !info.Mode().IsRegular() {
+	pages, err := renderedPDFPages(root, ext)
+	if err != nil {
+		return err
+	}
+	if len(pages) == 0 {
 		return errors.New("PDF rendering produced no output (empty or encrypted PDF?)")
 	}
+	if err := zipRenderedPages(outPath, pages, ext); err != nil {
+		return err
+	}
+	for _, p := range pages {
+		_ = os.Remove(p.path)
+	}
 	return nil
+}
+
+type renderedPDFPage struct {
+	number int
+	path   string
+}
+
+// renderedPDFPages finds pdftoppm's per-page output (root-<n>.<ext>,
+// zero-padded to a width that depends on the page count, so a fixed-width
+// pattern can't be assumed) and returns them sorted by actual page number
+// rather than filename, since e.g. "root-10.png" sorts before "root-2.png"
+// lexicographically.
+func renderedPDFPages(root, ext string) ([]renderedPDFPage, error) {
+	matches, err := filepath.Glob(root + "-*." + ext)
+	if err != nil {
+		return nil, err
+	}
+	pageNumRe := regexp.MustCompile(`-(\d+)\.` + regexp.QuoteMeta(ext) + `$`)
+	pages := make([]renderedPDFPage, 0, len(matches))
+	for _, m := range matches {
+		sub := pageNumRe.FindStringSubmatch(m)
+		if sub == nil {
+			continue
+		}
+		n, err := strconv.Atoi(sub[1])
+		if err != nil {
+			continue
+		}
+		pages = append(pages, renderedPDFPage{number: n, path: m})
+	}
+	sort.Slice(pages, func(i, j int) bool { return pages[i].number < pages[j].number })
+	return pages, nil
+}
+
+func zipRenderedPages(outPath string, pages []renderedPDFPage, ext string) (err error) {
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if closeErr := f.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	zw := zip.NewWriter(f)
+	defer func() {
+		if closeErr := zw.Close(); err == nil {
+			err = closeErr
+		}
+	}()
+	for _, p := range pages {
+		if err = copyIntoZip(zw, p, ext); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyIntoZip(zw *zip.Writer, p renderedPDFPage, ext string) error {
+	src, err := os.Open(p.path)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	w, err := zw.Create(fmt.Sprintf("page-%d.%s", p.number, ext))
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(w, src)
+	return err
 }
 
 func convertDocument(in, out, inPath, outPath string) error {
@@ -275,6 +507,43 @@ func (c *converter) convertImage(ctx context.Context, in, out, inPath, outPath s
 		return png.Encode(outFile, img)
 	}
 	return jpeg.Encode(outFile, img, &jpeg.Options{Quality: 90})
+}
+
+// pdfImportDPI is the pixel-to-point conversion rate used when sizing a
+// generated PDF page to its source image, matching the DPI already used
+// elsewhere in this project for PDF<->image rendering (convertPDF) so a
+// round trip through both conversions doesn't shift apparent print size.
+const pdfImportDPI = 150.0
+
+// convertImageToPDF wraps a single PNG/JPEG/WebP image as a one-page PDF
+// via pdfcpu (already a dependency for PDF structural validation, and pure
+// Go—no external tool needed, unlike every other conversion pair that
+// touches PDF or WebP in this file). The page is sized to the image's own
+// pixel dimensions (converted at pdfImportDPI) and the image is stretched
+// to fill it exactly, rather than pdfcpu's default of a fixed A4 page with
+// the image inset at half scale, since a converter's implicit job is "make
+// this a PDF", not "print this small on a letterhead".
+func convertImageToPDF(inPath, outPath string) error {
+	f, err := os.Open(inPath)
+	if err != nil {
+		return err
+	}
+	cfg, _, err := image.DecodeConfig(f)
+	_ = f.Close()
+	if err != nil {
+		return fmt.Errorf("could not read image dimensions: %w", err)
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return errors.New("image has invalid dimensions")
+	}
+	imp := api.DefaultImportConfig()
+	imp.UserDim = true
+	imp.Pos = types.Full
+	imp.PageDim = &types.Dim{
+		Width:  float64(cfg.Width) * 72 / pdfImportDPI,
+		Height: float64(cfg.Height) * 72 / pdfImportDPI,
+	}
+	return api.ImportImagesFile([]string{inPath}, outPath, imp, model.NewDefaultConfiguration())
 }
 
 func convertData(in, out, inPath, outPath string) error {

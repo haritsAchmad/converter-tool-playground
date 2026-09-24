@@ -68,6 +68,67 @@ func TestCSVToJSONJob(t *testing.T) {
 	t.Fatal("job did not complete")
 }
 
+// submitJob is a small generalization of TestCSVToJSONJob's inline
+// multipart-building for tests that need to vary the fields/file.
+func submitJob(t *testing.T, a *App, filename string, content []byte, fields map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	for k, v := range fields {
+		_ = mw.WriteField(k, v)
+	}
+	p, _ := mw.CreateFormFile("file", filename)
+	_, _ = p.Write(content)
+	_ = mw.Close()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/jobs", &body)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	a.Handler().ServeHTTP(w, r)
+	return w
+}
+
+// TestPDFModeRejectedWhenNotApplicable proves resolvePDFMode's validation
+// is actually wired into the HTTP endpoint, not just covered as an
+// internal function in isolation.
+func TestPDFModeRejectedWhenNotApplicable(t *testing.T) {
+	a := testApp(t)
+	w := submitJob(t, a, "people.csv", []byte("name,age\nAda,36\n"), map[string]string{
+		"outputFormat": "json", "pdfMode": "optimized",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for pdfMode on a non-PDF pair, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestPDFModeAcceptedAndPersistedForOfficeToPDF proves a valid pdfMode is
+// accepted, normalized, and round-trips through job creation's own JSON
+// response—without needing an actual LibreOffice conversion to run
+// (validation happens before the job reaches the worker).
+func TestPDFModeAcceptedAndPersistedForOfficeToPDF(t *testing.T) {
+	a := testApp(t)
+	// Job creation only needs supports() to say yes; it doesn't invoke
+	// LibreOffice, so a fake path is enough to get past that check (same
+	// technique TestOfficeCapabilitiesDependOnLibreOffice uses).
+	a.converter.libreoffice = filepath.Join("tools", "libreoffice")
+	docxBytes, err := os.ReadFile(writeMinimalDOCX(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := submitJob(t, a, "document.docx", docxBytes, map[string]string{
+		"outputFormat": "pdf", "pdfMode": "OPTIMIZED",
+	})
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", w.Code, w.Body.String())
+	}
+	var created Job
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.PDFMode != PDFModeOptimized {
+		t.Fatalf("expected pdfMode %q in the job response, got %q", PDFModeOptimized, created.PDFMode)
+	}
+}
+
 func TestRejectsDisguisedExecutable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "input.bin")
 	if err := os.WriteFile(path, []byte("MZnot really json"), 0600); err != nil {

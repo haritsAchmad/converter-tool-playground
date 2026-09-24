@@ -7,10 +7,10 @@ Small, self-hosted file conversion service with deliberately short-lived storage
 | Family | Formats | Notes |
 |---|---|---|
 | Structured data | CSV, JSON, XML, YAML | CSV output requires an array of flat objects. XML uses a deterministic generic representation. |
-| Images | PNG, JPEG/JPG, WebP | PNG↔JPEG is native Go. WebP appears only when ImageMagick is installed. Metadata is stripped on ImageMagick conversions. |
+| Images | PNG, JPEG/JPG, WebP | PNG↔JPEG is native Go. WebP appears only when ImageMagick is installed. Metadata is stripped on ImageMagick conversions. PNG/JPEG/WebP → PDF is native Go (pdfcpu) and always available: one page, sized to the source image at 150 DPI. |
 | Documents | Markdown, HTML | Markdown output is a best-effort semantic conversion. |
-| Office | DOCX, XLSX, PPTX → PDF | Uses isolated, headless LibreOffice profiles. Complex Microsoft-specific layout may render differently. |
-| PDF | PDF → PNG/JPEG | Renders the first page only, at a fixed 150 DPI, via poppler's `pdftoppm`; appears only when it's installed. Full-document rendering and PDF as an output format are future work. |
+| Office | DOCX, XLSX, PPTX → PDF | Uses isolated, headless LibreOffice profiles. Complex Microsoft-specific layout may render differently. Optional `pdfMode=optimized` (default `standard`, plain export) forces every Calc sheet onto one page, embeds standard fonts, and downsamples images to 150 DPI—see [Office → PDF fidelity modes](#office--pdf-fidelity-modes). |
+| PDF | PDF → PNG/JPEG | Renders every page (up to 300) at a fixed 150 DPI via poppler's `pdftoppm`, packaged as a ZIP with one `page-N.png`/`page-N.jpg` entry per page—even for a one-page source; appears only when `pdftoppm` is installed. PDF as an output format for non-image sources is future work. |
 
 The API returns capabilities at runtime, so unavailable engines are not advertised. PDF-to-Office, legacy Office formats, macro-enabled documents, audio, and video are intentionally not enabled; see [ROADMAP.md](ROADMAP.md).
 
@@ -60,7 +60,7 @@ Durations use Go syntax such as `30s` and `10m`.
 ## API
 
 - `GET /api/v1/formats` — capabilities and limits
-- `POST /api/v1/jobs` — multipart fields: `file`, `outputFormat`, optional `outputName`; rate-limited and quota-limited per IP
+- `POST /api/v1/jobs` — multipart fields: `file`, `outputFormat`, optional `outputName`, optional `pdfMode` (`standard` or `optimized`, only accepted when converting an Office document to PDF—see [Office → PDF fidelity modes](#office--pdf-fidelity-modes)); rate-limited and quota-limited per IP
 - `GET /api/v1/jobs/{uuid}` — job status
 - `GET /api/v1/jobs/{uuid}/download` — completed output
 - `GET /healthz` — liveness
@@ -78,11 +78,27 @@ curl -F file=@people.csv -F outputFormat=json -F outputName=people \
   http://localhost:8080/api/v1/jobs
 ```
 
+## Office → PDF fidelity modes
+
+DOCX/XLSX/PPTX → PDF jobs accept an optional `pdfMode` field, and the bundled web UI shows a matching selector once a target format of PDF is chosen for an Office file:
+
+| Mode | Behavior |
+|---|---|
+| `standard` (default) | Passes no LibreOffice export filter options at all—whatever page setup, fonts, and image fidelity the source document's own styles specify come through exactly as opening File → Export As PDF would produce, with nothing rewritten. |
+| `optimized` | Sets `SinglePageSheets` (Calc only—forces every sheet onto exactly one PDF page regardless of its own print area/paper size), `EmbedStandardFonts` (avoids silent font substitution in the reader), and `ReduceImageResolution`/`MaxImageResolution=150` (smaller file, downsampled images). This is a deliberate, opt-in trade-off—layout can shift from what the source document would otherwise print as—never the default. |
+
+`pdfMode` is rejected with `400` for any pair other than Office→PDF; it doesn't apply to image→PDF (that path is unrelated pure-Go code, not LibreOffice) or to PDF→image.
+
+```sh
+curl -F file=@report.xlsx -F outputFormat=pdf -F pdfMode=optimized \
+  http://localhost:8080/api/v1/jobs
+```
+
 ## Security model
 
 - Extension, detected MIME, magic bytes, and syntax/header validation are combined; filenames alone are never trusted.
-- CSV output quote-escapes cells that open with `=`, `+`, `-`, `@`, tab, or CR, so a converted value can't be interpreted as a formula/DDE command when opened in a spreadsheet (OWASP "CSV Injection"). The YAML and JSON decoders reject alias bombs and pathologically deep nesting outright rather than exhausting memory or the stack.
-- PDF input must clear two independent parsers before conversion: a magic-byte check, then a full structural validation pass with pdfcpu (pure Go, no cgo)—separate from the native `pdftoppm` renderer that actually touches the file afterward, so a PDF crafted to exploit one specific parser's bug is much less likely to also cleanly validate against the other. Rendering is capped to the first page at a fixed DPI and bounded by the same job timeout as everything else.
+- CSV output quote-escapes cells that open with `=`, `+`, `-`, `@`, tab, or CR, so a converted value can't be interpreted as a formula/DDE command when opened in a spreadsheet (OWASP "CSV Injection"). The YAML and JSON decoders reject alias bombs and pathologically deep nesting outright rather than exhausting memory or the stack. PNG/JPEG input is checked against a 100-megapixel ceiling using the header's declared dimensions before any full decode, so a small file can't claim an enormous width/height and force a multi-gigabyte allocation (decompression bomb).
+- PDF input must clear two independent parsers before conversion: a magic-byte check, then a full structural validation pass with pdfcpu (pure Go, no cgo)—separate from the native `pdftoppm` renderer that actually touches the file afterward, so a PDF crafted to exploit one specific parser's bug is much less likely to also cleanly validate against the other. That same validation pass also rejects anything over 300 pages, since rendering now covers every page (each becomes its own file before being zipped), not just the first. Rendering is capped to a fixed DPI and bounded by the same job timeout as everything else.
 - Executable/script extensions and common executable signatures are rejected.
 - OOXML input must be a plausible ZIP package of the matching family. Entry count, expanded size, compression ratio, and paths are bounded; macros, ActiveX, embedded objects, and external non-hyperlink resources are rejected before LibreOffice. Each conversion uses an ephemeral LibreOffice profile and the job deadline.
 - When `CONVERTBOX_CLAMSCAN` is configured, uploads must pass ClamAV before entering the conversion queue. Detection rejects the upload; scanner errors and timeouts fail closed.

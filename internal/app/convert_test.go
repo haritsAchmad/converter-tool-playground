@@ -1,6 +1,11 @@
 package app
 
 import (
+	"bytes"
+	"encoding/binary"
+	"hash/crc32"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -87,5 +92,64 @@ func TestJSONDeepNestingRejected(t *testing.T) {
 	}
 	if _, err := decodeData("json", []byte(b.String())); err == nil {
 		t.Fatal("expected deeply nested JSON to be rejected, decode succeeded")
+	}
+}
+
+// pngHeader builds a minimal-but-valid PNG signature + IHDR chunk declaring
+// the given dimensions, with no IDAT/IEND. image.DecodeConfig only needs
+// IHDR to report width/height for this color type, so it's enough to drive
+// validateUpload's dimension check without actually materializing a
+// gigantic image on disk for the test.
+func pngHeader(t *testing.T, width, height uint32) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	buf.Write([]byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a})
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr[0:4], width)
+	binary.BigEndian.PutUint32(ihdr[4:8], height)
+	ihdr[8] = 8 // bit depth
+	ihdr[9] = 6 // color type: truecolor with alpha
+	writeChunk(t, &buf, "IHDR", ihdr)
+	return buf.Bytes()
+}
+
+func writeChunk(t *testing.T, buf *bytes.Buffer, typ string, data []byte) {
+	t.Helper()
+	var lenBuf [4]byte
+	binary.BigEndian.PutUint32(lenBuf[:], uint32(len(data)))
+	buf.Write(lenBuf[:])
+	typeAndData := append([]byte(typ), data...)
+	buf.Write(typeAndData)
+	var crcBuf [4]byte
+	binary.BigEndian.PutUint32(crcBuf[:], crc32.ChecksumIEEE(typeAndData))
+	buf.Write(crcBuf[:])
+}
+
+// TestRejectsImageDimensionBomb guards against a "decompression bomb": a
+// tiny PNG whose header lies about having an enormous pixel count, which
+// would otherwise sail through the (small) upload size limit and then have
+// image.Decode allocate a multi-gigabyte pixel buffer during conversion.
+// validateUpload must reject it from the declared header alone, before any
+// full decode is attempted.
+func TestRejectsImageDimensionBomb(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bomb.png")
+	// 40000 x 40000 = 1.6 billion declared pixels, far past the 100M limit.
+	if err := os.WriteFile(path, pngHeader(t, 40000, 40000), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateUpload(path, "bomb.png"); err == nil {
+		t.Fatal("expected oversized declared image dimensions to be rejected")
+	}
+}
+
+// TestAcceptsReasonableImageDimensions locks in that the new dimension
+// check doesn't collaterally reject ordinary, modestly sized images.
+func TestAcceptsReasonableImageDimensions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ok.png")
+	if err := os.WriteFile(path, pngHeader(t, 1920, 1080), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateUpload(path, "ok.png"); err != nil {
+		t.Fatalf("expected a reasonably sized image to pass validation, got %v", err)
 	}
 }

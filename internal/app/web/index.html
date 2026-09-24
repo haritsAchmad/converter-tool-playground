@@ -30,6 +30,12 @@
           <label>FORMAT TUJUAN<select id="output" name="outputFormat" required disabled><option value="">Pilih file dulu</option></select></label>
           <label>NAMA BARU <span>(OPSIONAL)</span><input name="outputName" maxlength="80" placeholder="mis. laporan-final"></label>
         </div>
+        <label id="pdf-mode-field" hidden>MODE PDF
+          <select id="pdf-mode" name="pdfMode" disabled>
+            <option value="standard">Standar — tata letak asli apa adanya</option>
+            <option value="optimized">Dioptimalkan — tiap sheet Calc jadi satu halaman, font ikut disematkan, gambar dikecilkan</option>
+          </select>
+        </label>
         <button id="submit" disabled><span>CONVERT SEKARANG</span><b>→</b></button>
       </form>
       <div id="status" class="status" hidden aria-live="polite"></div>
