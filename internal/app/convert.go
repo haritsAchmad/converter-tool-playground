@@ -304,17 +304,23 @@ func (c *converter) convertOffice(ctx context.Context, in, pdfMode, inPath, outP
 // Unlike the pure-Go HTML<->Markdown text conversion this codebase already
 // had, this path actually RENDERS the document with a real layout engine
 // that resolves references, so it goes through validateHTMLForPDF first:
-// <script>/<iframe>/inline-event-handler content and, just as importantly,
-// any external resource reference (an <img src="http://...">, a stylesheet
-// <link>, or a CSS url(...) pointing off-box) has to be rejected rather
-// than let LibreOffice fetch it during conversion—the same SSRF-shaped risk
-// already flagged for FFmpeg's network-capable input protocols on the
-// roadmap, just reached through a document instead of a filename. That
-// application-level reject-list is a best-effort blocklist, not a full
-// sanitizer (see validateHTMLForPDF); real defense in depth still wants the
-// LibreOffice worker denied outbound network access at the OS/container
-// level, which remains follow-up hardening (see ROADMAP.md), same as the
-// egress-denied worker isolation already noted for Office->PDF.
+// <script>/<iframe>/inline-event-handler content is rejected, and every
+// resource reference (an <img src>, a stylesheet <link>, a CSS url(...),
+// ...) is accepted only as an inline data: URI—including a same-directory
+// relative path or an absolute filesystem path, not just an external
+// http(s) URL, since LibreOffice resolves either against the document's
+// real on-disk location and a job's per-job working directory is not a
+// sandbox. That's the same SSRF/local-file-read-shaped risk already
+// flagged for FFmpeg's network-capable input protocols on the roadmap,
+// just reached through a document instead of a filename. It's a
+// default-deny allowlist for resource references, parsed and checked
+// against the same decoded attribute values LibreOffice's own parser would
+// act on (not pattern-matched against the raw, possibly HTML-entity-
+// encoded bytes)—see validateHTMLForPDF—but still not a full sanitizer;
+// real defense in depth still wants the LibreOffice worker denied outbound
+// network access at the OS/container level, which remains follow-up
+// hardening (see ROADMAP.md), same as the egress-denied worker isolation
+// already noted for Office->PDF.
 func (c *converter) convertMarkupToPDF(ctx context.Context, in, inPath, outPath string) error {
 	if c.libreoffice == "" {
 		return errors.New("PDF rendering is not available")

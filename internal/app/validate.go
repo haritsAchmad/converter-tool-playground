@@ -20,6 +20,7 @@ import (
 
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+	"golang.org/x/net/html"
 	"gopkg.in/yaml.v3"
 )
 
@@ -190,41 +191,139 @@ const (
 	maxPDFPages = 300
 )
 
-// dangerousHTMLPattern is a best-effort reject-list for HTML about to be
-// rendered by LibreOffice for PDF export (see convertMarkupToPDF), not a
-// full sanitizer—matching this codebase's existing rejectActiveContent
-// (only "<?php"/"<?="), it deliberately trades completeness for a simple,
-// auditable rule. It flags: known active-content tags (script/iframe and
-// friends, plus <base>, which can redirect every *relative* URL in the
-// document to an attacker-chosen host); inline event-handler attributes
-// (onload=, onclick=, ...); javascript: URIs; and any src/srcset, <link
-// href>, or CSS url(...) reference that resolves to an absolute or
-// protocol-relative external URL (http(s)/ftp/file/"//")—the references
-// LibreOffice actually fetches while rendering, unlike a plain <a href>
-// hyperlink, which just becomes a clickable annotation in the exported
-// PDF and is deliberately left alone here (mirroring validateOOXML's own
-// allowance for hyperlink relationships). A relative reference (a local
-// image path, say) is left alone too: it can't resolve to anything since
-// the staged HTML is the only file in its per-job working directory, so
-// it just renders as a missing image rather than being fetched from
-// anywhere.
-var dangerousHTMLPattern = regexp.MustCompile(`(?i)<(?:script|iframe|object|embed|applet|base)\b` +
-	`|\son\w+\s*=` +
-	`|javascript:` +
-	`|\b(?:src|srcset)\s*=\s*["']?\s*(?:https?:|ftp:|file:|//)` +
-	`|<link\b[^>]*\bhref\s*=\s*["']?\s*(?:https?:|ftp:|file:|//)` +
-	`|url\(\s*["']?\s*(?:https?:|ftp:|file:|//)`)
+// dangerousHTMLTags are rejected outright regardless of attributes:
+// known active-content elements, plus <base>, which can redirect every
+// *relative* URL in the rest of the document to an attacker-chosen origin
+// or filesystem path.
+var dangerousHTMLTags = map[string]bool{"script": true, "iframe": true, "object": true, "embed": true, "applet": true, "base": true}
+
+// resourceAttrs are the attributes LibreOffice's HTML import can actually
+// fetch or read from while rendering: image/media/stylesheet references,
+// plus the less common ones (poster, background, formaction/action, an
+// <object>'s data) a hand-built or generated document could still use.
+// href is deliberately excluded here and handled separately per-element,
+// since an <a href> is never fetched—it just becomes a clickable
+// annotation in the exported PDF.
+var resourceAttrs = map[string]bool{"src": true, "srcset": true, "poster": true, "background": true, "formaction": true, "action": true, "data": true}
+
+// cssURLPattern extracts the argument of a CSS url(...) function, used
+// both on a parsed style="" attribute value and directly on a raw <style>
+// block's text content.
+var cssURLPattern = regexp.MustCompile(`(?i)url\(\s*["']?([^"')]*)["']?\s*\)`)
 
 // validateHTMLForPDF gates convertMarkupToPDF's input (original HTML
 // uploads, and goldmark-rendered HTML from a Markdown upload) right before
 // it's handed to LibreOffice: that conversion actually renders the
 // document with a real layout engine that resolves references, unlike the
 // pure-Go HTML<->Markdown text transform this codebase already had, which
-// never fetches or executes anything. See dangerousHTMLPattern for what's
-// rejected and why.
-func validateHTMLForPDF(html []byte) error {
-	if dangerousHTMLPattern.Match(html) {
-		return errors.New("HTML contains active content or an external resource reference, which is not accepted for PDF rendering")
+// never fetches or executes anything.
+//
+// This parses the document with golang.org/x/net/html rather than
+// pattern-matching the raw bytes: an attribute value like
+// src="&#104;ttp://127.0.0.1/probe.png" is an HTML entity-encoded "http:"
+// that a real parser (LibreOffice's included) decodes back into a live
+// URL before acting on it, so any check written against the undecoded
+// text can be trivially bypassed the same way (temuan review P1). Walking
+// the parsed tree and inspecting each attribute's decoded value closes
+// that gap by construction—it checks the same value the renderer will.
+//
+// It's a default-deny allowlist, not a denylist of known-bad schemes: a
+// resource reference (src/srcset/poster/background/formaction/action/an
+// <object>'s data, a <link>'s href, or a CSS url(...) in a style
+// attribute or a <style> block) is accepted only as an inline data: URI;
+// everything else is rejected, including a bare relative or absolute
+// filesystem path. An earlier version of this check allowed relative
+// paths on the theory that the staged HTML has no sibling files to
+// resolve them against, which missed that "relative" is resolved by
+// LibreOffice against the *document's own location* on disk, and ".."
+// segments (or an outright absolute path) can walk out of that per-job
+// directory into a sibling job's files or anywhere else the worker
+// process can read (temuan review P1, second finding)—there being no
+// legitimate use for a local file reference at all (a job is always
+// exactly one uploaded file, never a document-plus-assets bundle) makes
+// rejecting every non-data: reference outright both safer and simpler
+// than trying to canonicalize and allowlist a path. <script> and friends
+// are rejected outright (dangerousHTMLTags), inline event-handler
+// attributes (onclick=, onload=, ...) and javascript: URIs are rejected
+// wherever they appear (including in an otherwise-allowed <a href>), and
+// an <a href> to anything else is left alone, mirroring validateOOXML's
+// own allowance for hyperlink relationships.
+func validateHTMLForPDF(htmlBytes []byte) error {
+	doc, err := html.Parse(bytes.NewReader(htmlBytes))
+	if err != nil {
+		return fmt.Errorf("invalid HTML: %w", err)
+	}
+	var walk func(*html.Node) error
+	walk = func(n *html.Node) error {
+		if n.Type == html.ElementNode {
+			tag := strings.ToLower(n.Data)
+			if dangerousHTMLTags[tag] {
+				return fmt.Errorf("HTML contains a <%s> element, which is not accepted for PDF rendering", tag)
+			}
+			for _, a := range n.Attr {
+				name := strings.ToLower(a.Key)
+				if strings.HasPrefix(name, "on") {
+					return fmt.Errorf("HTML contains an inline event-handler attribute (%s), which is not accepted for PDF rendering", name)
+				}
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(a.Val)), "javascript:") {
+					return errors.New("HTML contains a javascript: URI, which is not accepted for PDF rendering")
+				}
+				if name == "style" {
+					if err := validateCSSForPDF(a.Val); err != nil {
+						return err
+					}
+					continue
+				}
+				isHref := name == "href"
+				if isHref && tag == "a" {
+					continue // a hyperlink is never fetched; see doc comment.
+				}
+				if (resourceAttrs[name] || isHref) && !isSafeResourceRef(a.Val) {
+					return fmt.Errorf("HTML contains a %s reference to something other than an inline data: URI, which is not accepted for PDF rendering", name)
+				}
+			}
+		}
+		if n.Type == html.ElementNode && strings.ToLower(n.Data) == "style" {
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if c.Type == html.TextNode {
+					if err := validateCSSForPDF(c.Data); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if err := walk(c); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return walk(doc)
+}
+
+// isSafeResourceRef reports whether a resource reference is empty (no
+// reference at all) or an inline data: URI—the only kind
+// validateHTMLForPDF accepts. See its doc comment for why every other
+// form, including a same-directory relative path, is rejected.
+func isSafeResourceRef(val string) bool {
+	val = strings.TrimSpace(val)
+	return val == "" || strings.HasPrefix(strings.ToLower(val), "data:")
+}
+
+// validateCSSForPDF applies the same data:-only policy to every CSS
+// url(...) reference in css, whether that's a parsed style="" attribute
+// value or a raw <style> block's text content. HTML entity references are
+// not interpreted inside a <style> element's text per the HTML5 raw-text
+// element rules (Go's html.Parse follows this: a <style>/<script>'s child
+// text node is the literal, undecoded source), so checking the raw text
+// directly is correct there, not a gap the way it would be for an
+// attribute value.
+func validateCSSForPDF(css string) error {
+	for _, m := range cssURLPattern.FindAllStringSubmatch(css, -1) {
+		if !isSafeResourceRef(m[1]) {
+			return errors.New("HTML contains a CSS url() reference to something other than an inline data: URI, which is not accepted for PDF rendering")
+		}
 	}
 	return nil
 }

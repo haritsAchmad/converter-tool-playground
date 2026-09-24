@@ -29,12 +29,14 @@ func TestSupportsMarkdownAndHTMLToPDF(t *testing.T) {
 	}
 }
 
-// TestValidateHTMLForPDF is a table of what convertMarkupToPDF's
-// dangerousHTMLPattern reject-list accepts and rejects (see its doc
-// comment for the reasoning): active-content tags, inline event handlers,
-// javascript: URIs, and any src/srcset/<link href>/CSS url() pointing at
-// an external origin are rejected, while an ordinary <a href> hyperlink,
-// a relative reference, and a data: URI are left alone.
+// TestValidateHTMLForPDF is a table of what validateHTMLForPDF accepts and
+// rejects (see its doc comment for the reasoning): active-content tags,
+// inline event handlers, javascript: URIs, and any resource reference
+// (src/srcset/poster/background/formaction/action/an <object>'s
+// data/a <link> href/CSS url()) other than an inline data: URI are
+// rejected—including a same-directory relative path or an absolute
+// filesystem path, not just an external http(s) URL—while an ordinary
+// <a href> hyperlink and a data: URI are left alone.
 func TestValidateHTMLForPDF(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -43,7 +45,7 @@ func TestValidateHTMLForPDF(t *testing.T) {
 	}{
 		{"plain paragraph", `<p>Hello <em>world</em></p>`, false},
 		{"hyperlink to external site", `<p><a href="https://example.com">link</a></p>`, false},
-		{"relative image", `<img src="local.png">`, false},
+		{"hyperlink to local path", `<p><a href="../other-job/output.png">link</a></p>`, false},
 		{"data URI image", `<img src="data:image/png;base64,aGVsbG8=">`, false},
 		{"script tag", `<script>alert(1)</script>`, true},
 		{"iframe tag", `<iframe src="https://example.com"></iframe>`, true},
@@ -51,13 +53,27 @@ func TestValidateHTMLForPDF(t *testing.T) {
 		{"embed tag", `<embed src="https://example.com/x.swf">`, true},
 		{"base tag", `<base href="http://evil.example/">`, true},
 		{"inline event handler", `<div onclick="doStuff()">hi</div>`, true},
-		{"javascript URI", `<a href="javascript:alert(1)">click</a>`, true},
+		{"javascript URI on img src", `<img src="javascript:alert(1)">`, true},
+		{"javascript URI on a href", `<a href="javascript:alert(1)">click</a>`, true},
 		{"external image src", `<img src="http://evil.example/x.png">`, true},
 		{"external image srcset", `<img srcset="http://evil.example/x.png 1x">`, true},
 		{"protocol-relative src", `<img src="//evil.example/x.png">`, true},
 		{"external stylesheet link", `<link rel="stylesheet" href="https://evil.example/x.css">`, true},
 		{"external CSS url()", `<style>body{background:url(http://evil.example/bg.png)}</style>`, true},
 		{"inline style external url()", `<p style="background:url('https://evil.example/bg.png')">hi</p>`, true},
+		// temuan review P1, finding 1: an HTML entity-encoded scheme
+		// ("&#104;ttp:" decodes to "http:") must still be caught. A raw
+		// byte-level regex over the undecoded source misses this; parsing
+		// the document and checking the decoded attribute value doesn't.
+		{"HTML entity-encoded external URL", `<img src="&#104;ttp://127.0.0.1:8080/probe.png">`, true},
+		// temuan review P1, finding 2: a relative or absolute local path is
+		// not "just a missing image"—LibreOffice resolves it against the
+		// staged document's real location on disk, so it can walk out of
+		// the per-job directory into a sibling job's files or anywhere else
+		// readable, or read an absolute path directly.
+		{"relative path traversal", `<img src="../../other-job/output.png">`, true},
+		{"absolute filesystem path", `<img src="/tmp/private.png">`, true},
+		{"plain relative image", `<img src="local.png">`, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -91,18 +107,28 @@ func fakeLibreOfficeConverter(t *testing.T) *converter {
 // happened before the subprocess was ever started.
 func TestConvertMarkupToPDFRejectsDangerousContentBeforeInvokingLibreOffice(t *testing.T) {
 	c := fakeLibreOfficeConverter(t)
-	cases := map[string]string{
-		"html":     `<html><body><script>alert(1)</script></body></html>`,
-		"markdown": "hello ![img](http://evil.example/x.png)",
+	cases := []struct {
+		name, in, content string
+	}{
+		{"html script tag", "html", `<html><body><script>alert(1)</script></body></html>`},
+		{"markdown external image", "markdown", "hello ![img](http://evil.example/x.png)"},
+		// temuan review P1: an HTML entity-encoded scheme, and a
+		// relative/absolute local path, both have to be rejected here too,
+		// not just in the validateHTMLForPDF unit table above—proving the
+		// full convertMarkupToPDF call path (parse -> validate -> exec)
+		// actually stops before LibreOffice for both.
+		{"html entity-encoded external URL", "html", `<html><body><img src="&#104;ttp://127.0.0.1:8080/probe.png"></body></html>`},
+		{"html path traversal", "html", `<html><body><img src="../../other-job/output.png"></body></html>`},
+		{"html absolute filesystem path", "html", `<html><body><img src="/tmp/private.png"></body></html>`},
 	}
-	for in, content := range cases {
-		t.Run(in, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			inPath := filepath.Join(t.TempDir(), "input.bin")
-			if err := os.WriteFile(inPath, []byte(content), 0600); err != nil {
+			if err := os.WriteFile(inPath, []byte(tc.content), 0600); err != nil {
 				t.Fatal(err)
 			}
 			outPath := filepath.Join(t.TempDir(), "output.pdf")
-			err := c.run(context.Background(), in, "pdf", "", inPath, outPath)
+			err := c.run(context.Background(), tc.in, "pdf", "", inPath, outPath)
 			if err == nil {
 				t.Fatal("expected an error")
 			}
@@ -221,7 +247,7 @@ func TestConvertMarkdownAndHTMLToPDF(t *testing.T) {
 		in   string
 		body string
 	}{
-		{"markdown", "markdown", "# Hello\n\nSome *text* and a local image ![alt](local.png).\n"},
+		{"markdown", "markdown", "# Hello\n\nSome *text* and a [link](https://example.com).\n"},
 		{"html", "html", `<html><body><h1>Hello</h1><p>Some text and a <a href="https://example.com">link</a>.</p></body></html>`},
 	}
 	for _, tc := range cases {
