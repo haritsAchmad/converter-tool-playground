@@ -76,7 +76,42 @@ func (s *store) persist(j *Job) error {
 	if err := os.WriteFile(tmp, data, 0600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, filepath.Join(dir, jobStateFile))
+	return renameWithRetry(tmp, filepath.Join(dir, jobStateFile))
+}
+
+// renameWithRetry retries a same-directory os.Rename briefly on a
+// transient error, the write-side counterpart to readJobState's own
+// read-side retry. On Windows, os.Rename onto an existing destination
+// needs to open that destination with delete access, which fails with
+// "Access is denied" for as long as any other handle has it open for
+// reading—which a concurrent status poll's readJobState (a plain
+// os.ReadFile, open-read-close) does for a very short but nonzero
+// window. Confirmed empirically, not assumed: instrumenting persist's
+// os.Rename call and hammering a fast-completing job (SVG rasterizes in
+// low single-digit milliseconds, so several persist() calls land close
+// together while a 10ms-interval status poll is also reading the same
+// file) reproduced "Access is denied" on effectively every run under
+// `go test -race` (whose added scheduling overhead widens the
+// collision window further). Without a retry, persist()'s caller in
+// both worker() and process() only logs the failure and moves on—for
+// process()'s FINAL Completed/Failed persist specifically, that also
+// skips ackJob entirely (process returns false)—permanently stranding
+// the job's on-disk state at whatever its last successful write was,
+// most visibly "processing" forever, since every status read in this
+// codebase (getJob and the worker's own dequeue) reloads from that
+// file, never from the in-memory pointer a worker keeps mutating after
+// persist() returns. 5 attempts at a 10ms backoff comfortably outlasts
+// the reader's open-read-close window (microseconds in practice) while
+// still failing fast on a genuine, non-transient error.
+func renameWithRetry(oldpath, newpath string) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		if err = os.Rename(oldpath, newpath); err == nil {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return err
 }
 
 func (s *store) countActiveByIP(ip string) int {

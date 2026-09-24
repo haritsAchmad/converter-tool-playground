@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/draw"
 	"image/jpeg"
 	"image/png"
 	"io"
@@ -27,6 +28,8 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
+	"github.com/srwiley/oksvg"
+	"github.com/srwiley/rasterx"
 	"github.com/yuin/goldmark"
 	"gopkg.in/yaml.v3"
 )
@@ -56,6 +59,7 @@ var formats = map[string]Format{
 	"ogg":      {"ogg", "Ogg (Vorbis/Opus)", "Audio", []string{".ogg"}},
 	"mp4":      {"mp4", "MP4 (H.264)", "Video", []string{".mp4"}},
 	"webm":     {"webm", "WebM (VP8/VP9)", "Video", []string{".webm"}},
+	"svg":      {"svg", "SVG", "Image", []string{".svg"}},
 }
 
 var dataFormats = map[string]bool{"csv": true, "json": true, "xml": true, "yaml": true}
@@ -97,6 +101,27 @@ var videoFormats = map[string]bool{"mp4": true, "webm": true}
 // officeFormats-only on purpose, and convertOffice is always called with
 // pdfMode="" for this family (see converter.run).
 var odfFormats = map[string]bool{"odt": true, "ods": true, "odp": true}
+
+// svgOutputFormats are the only formats SVG input may be converted to:
+// PNG and JPEG, both rasterized in pure Go via oksvg/rasterx (see
+// convertSVG)—deliberately one-directional (no format converts TO svg,
+// and svg never round-trips as svg->svg, unlike every other image pair
+// in imageFormats). This is the "rasterization boundary" half of the
+// roadmap's "SVG only after a dedicated sanitizer and rasterization
+// boundary" requirement: an untrusted SVG is never handed to anything
+// that treats it as a document to open (a browser, an SVG-aware image
+// library with scripting support)—it is only ever rasterized into an
+// inert bitmap by a renderer that structurally can't execute or fetch
+// anything (verified directly against oksvg's source: its element
+// dispatch table implements only path/shape/gradient/group elements
+// plus a same-document-only <use>, and the package imports no
+// networking or exec package anywhere). WebP isn't offered here the
+// same way it isn't offered for PDF->image: there's no pure-Go WebP
+// encoder in this project's dependencies (image conversion's own
+// svg/webp pairs already shell out to ImageMagick instead), and adding
+// an external-tool round trip just for this would undercut the point
+// of a pure-Go rasterization boundary.
+var svgOutputFormats = map[string]bool{"png": true, "jpeg": true}
 
 func newConverter() *converter {
 	magick, _ := exec.LookPath("magick")
@@ -157,6 +182,11 @@ func (c *converter) supports(in, out string) bool {
 	if imageFormats[in] && out == "pdf" {
 		// Pure Go via pdfcpu (already a dependency for PDF structural
 		// validation)—no external tool required, so always available.
+		return true
+	}
+	if in == "svg" && svgOutputFormats[out] {
+		// Pure Go via oksvg/rasterx—no external tool required, so always
+		// available, same as the imageFormats->pdf pair above.
 		return true
 	}
 	if imageFormats[in] && imageFormats[out] {
@@ -232,6 +262,9 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 	}
 	if imageFormats[in] && out == "pdf" {
 		return convertImageToPDF(inPath, outPath)
+	}
+	if in == "svg" {
+		return convertSVG(out, inPath, outPath)
 	}
 	if imageFormats[in] {
 		return c.convertImage(ctx, in, out, inPath, outPath)
@@ -747,6 +780,76 @@ func convertImageToPDF(inPath, outPath string) error {
 		Height: float64(cfg.Height) * 72 / pdfImportDPI,
 	}
 	return api.ImportImagesFile([]string{inPath}, outPath, imp, model.NewDefaultConfiguration())
+}
+
+// defaultSVGCanvasSize is the raster canvas side length (in pixels) used
+// when an SVG's root element declares no width, height, or viewBox at
+// all (oksvg's own attribute parser does strip common unit suffixes
+// like "px" before calling strconv.ParseFloat—verified directly against
+// its source—so a width="200px"/height="200px" pair with no viewBox
+// parses fine; it's a fully dimensionless <svg> that leaves ViewBox.W/H
+// at zero). Rather than reject a real-world SVG over this, convertSVG
+// falls back to a fixed square canvas and skips SetTarget (which would
+// otherwise divide by a zero ViewBox dimension), rendering in the SVG's
+// own coordinate space onto that canvas—a lower-fidelity but still safe
+// result.
+const defaultSVGCanvasSize = 512
+
+// convertSVG is the "rasterization boundary" half of the roadmap's "SVG
+// only after a dedicated sanitizer and rasterization boundary"
+// requirement (the sanitizer half is validateSVG, applied at upload
+// time). It renders the SVG with oksvg/rasterx, a pure-Go rasterizer
+// with no scripting engine and no networking or filesystem access of
+// its own (verified directly against its source: the element dispatch
+// table in its draw.go implements only svg/g/line/rect/circle/ellipse/
+// polyline/polygon/path/title/desc/defs/style/linearGradient/
+// radialGradient/use—no script, no image, no foreignObject, no SMIL
+// animation—and neither oksvg nor rasterx imports net/http, net, or
+// os/exec anywhere in either package), so even an SVG that somehow
+// slipped past validateSVG's own explicit denylist can only fail to
+// render the parts this parser doesn't understand, never execute or
+// fetch anything through it. This holds independently of validateSVG,
+// by construction of the library, not because validateSVG is trusted to
+// have already caught everything.
+func convertSVG(out, inPath, outPath string) error {
+	icon, err := oksvg.ReadIcon(inPath)
+	if err != nil {
+		return fmt.Errorf("could not parse SVG: %w", err)
+	}
+	w, h := int(icon.ViewBox.W), int(icon.ViewBox.H)
+	if w <= 0 || h <= 0 {
+		w, h = defaultSVGCanvasSize, defaultSVGCanvasSize
+	} else {
+		icon.SetTarget(0, 0, float64(w), float64(h))
+	}
+	// Same decompression-bomb-shaped ceiling as an ordinary PNG/JPEG
+	// upload's declared dimensions (maxImageDecodedPixels)—a hostile SVG
+	// can declare an arbitrarily large viewBox just as freely as a PNG
+	// header can lie about its dimensions, and the raster canvas below is
+	// allocated eagerly at this size regardless of how little the SVG
+	// actually draws into it.
+	if int64(w)*int64(h) > maxImageDecodedPixels {
+		return errors.New("SVG canvas dimensions exceed the safety limit")
+	}
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	if out == "jpeg" {
+		// JPEG has no alpha channel; an SVG's default (unpainted) canvas
+		// is transparent, which would otherwise encode as black.
+		draw.Draw(img, img.Bounds(), image.White, image.Point{}, draw.Src)
+	}
+	scanner := rasterx.NewScannerGV(w, h, img, img.Bounds())
+	raster := rasterx.NewDasher(w, h, scanner)
+	icon.Draw(raster, 1.0)
+
+	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer outFile.Close()
+	if out == "png" {
+		return png.Encode(outFile, img)
+	}
+	return jpeg.Encode(outFile, img, &jpeg.Options{Quality: 90})
 }
 
 // audioOutputEncoder maps each accepted output container to the specific

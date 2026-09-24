@@ -144,6 +144,22 @@ func validateUpload(path, original string) (string, error) {
 		if !bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}) {
 			return "", errors.New("extension and WebM signature do not match")
 		}
+	case "svg":
+		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
+			return "", errors.New("text input must be valid UTF-8 without NUL bytes")
+		}
+		// SVG has no fixed magic byte signature the way a binary format
+		// does—it's XML text that may be preceded by a BOM, an <?xml?>
+		// prolog, comments, or a DOCTYPE before the root element. This
+		// check is deliberately loose (a case-insensitive substring search
+		// for the root tag within the read head), the same way the mp4/
+		// webm checks above are: validateSVG's real structural XML parse
+		// right below is the authoritative check, this just rejects a
+		// .svg-named file that plainly isn't XML/SVG at all before that
+		// heavier parse runs.
+		if !bytes.Contains(bytes.ToLower(head), []byte("<svg")) {
+			return "", errors.New("extension and SVG signature do not match")
+		}
 	default:
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
 			return "", errors.New("text input must be valid UTF-8 without NUL bytes")
@@ -203,6 +219,9 @@ func validateSyntax(format, path string) error {
 	}
 	if videoFormats[format] {
 		return validateVideo(format, path)
+	}
+	if format == "svg" {
+		return validateSVG(path)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -859,6 +878,155 @@ func validateCSSForPDF(css string) error {
 		if !isSafeResourceRef(m[1]) {
 			return errors.New("HTML contains a CSS url() reference to something other than an inline data: URI, which is not accepted for PDF rendering")
 		}
+	}
+	return nil
+}
+
+// dangerousSVGTags are SVG elements capable of carrying active content
+// (script execution) or resolving something beyond the document's own
+// contents when opened by a real SVG-consuming renderer—a browser, an
+// image viewer, anything other than convertSVG's own oksvg/rasterx
+// pipeline. Rejected outright here, mirroring dangerousHTMLTags's role
+// for validateHTMLForPDF. This is a genuinely separate guarantee from
+// convertSVG's own safety, not a workaround for a gap in it: oksvg
+// doesn't implement any of these elements either (verified directly
+// against its drawFuncs dispatch table—see convertSVG's doc comment),
+// so an SVG rejected here would likely just render inert through oksvg
+// regardless; validateSVG exists so a file carrying one of these is
+// rejected outright rather than silently accepted and silently
+// defanged, since a rejected upload is a clear signal to whoever sent
+// it and a silently-accepted one isn't.
+var dangerousSVGTags = map[string]bool{
+	"script": true, "foreignobject": true, "image": true,
+	"iframe": true, "embed": true, "object": true, "applet": true,
+	"audio": true, "video": true, "handler": true,
+	"animate": true, "animatetransform": true, "animatemotion": true,
+	"animatecolor": true, "set": true,
+}
+
+// maxSVGElements bounds the number of XML elements validateSVG will walk
+// before giving up, the SVG-side analog of maxZIPPackageEntries: a small
+// file can still declare an enormous flat element count (no nesting, no
+// entity expansion needed—Go's encoding/xml has neither DTD entity
+// expansion nor external entity resolution, verified directly against a
+// billion-laughs-shaped and an XXE-shaped payload: both fail to parse
+// with "invalid character entity" the moment a custom entity is
+// referenced, never fetching or expanding anything), which would
+// otherwise cost unbounded CPU/memory in both this walk and oksvg's own
+// parse.
+const maxSVGElements = 50_000
+
+// isSafeSVGHref accepts an empty value, a same-document "#fragment"
+// reference (the only kind oksvg's own <use> implementation resolves—see
+// convertSVG's doc comment—so there's no legitimate case a real SVG
+// needs anything else here), or a safe inline data: image URI
+// (isSafeDataURI, shared with validateHTMLForPDF). Unlike
+// isSafeResourceRef, which backs validateHTMLForPDF's own href checks, a
+// bare "#fragment" is accepted here: HTML's own href handling never
+// reaches isSafeResourceRef for an <a href> in the first place (it's
+// skipped outright, since a hyperlink is never fetched there either), so
+// isSafeResourceRef was never written to recognize one.
+func isSafeSVGHref(val string) bool {
+	val = strings.TrimSpace(val)
+	return val == "" || strings.HasPrefix(val, "#") || isSafeDataURI(val)
+}
+
+// validateSVG is the "dedicated sanitizer" half of the roadmap's "SVG
+// only after a dedicated sanitizer and rasterization boundary"
+// requirement (the rasterization-boundary half is convertSVG). It parses
+// the file as XML with the standard library decoder—which, unlike a
+// general-purpose SVG/browser parser, never expands a DOCTYPE-declared
+// entity or resolves an external one (see maxSVGElements's doc comment)
+// and auto-decodes ordinary character/entity references in attribute
+// values and text, closing the same "encoded scheme prefix slips past a
+// raw-bytes check" gap validateHTMLForPDF's own doc comment describes
+// for HTML—and walks every element, rejecting outright: a root element
+// that isn't <svg>, any element in dangerousSVGTags, any inline
+// event-handler attribute (onload=, onclick=, ...), any javascript: URI
+// in any attribute, any href/xlink:href that isn't a same-document
+// "#fragment" reference or a safe inline data: image URI
+// (isSafeResourceRef, shared with validateHTMLForPDF), and any CSS
+// (style attribute or <style> element content) carrying a url() to
+// anything but a safe data: URI (validateCSSForPDF, also shared). A
+// leading DOCTYPE is rejected outright too: a real SVG has no legitimate
+// use for one, and Go's decoder already can't be tricked by what a
+// DOCTYPE would normally declare, so this only ever rejects something
+// with no benign purpose here (mirrors validateHTMLForPDF's own
+// no-legitimate-use-case reasoning for rejecting every local file
+// reference outright).
+func validateSVG(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if i := bytes.IndexByte(b, 0); i >= 0 {
+		return errors.New("SVG contains a NUL byte")
+	}
+	if bytes.Contains(bytes.ToUpper(b), []byte("<!DOCTYPE")) {
+		return errors.New("SVG contains a DOCTYPE declaration, which is not accepted")
+	}
+	dec := xml.NewDecoder(bytes.NewReader(b))
+	sawRoot := false
+	inStyle := false
+	elements := 0
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return fmt.Errorf("invalid SVG/XML syntax: %w", err)
+		}
+		switch t := tok.(type) {
+		case xml.StartElement:
+			elements++
+			if elements > maxSVGElements {
+				return fmt.Errorf("SVG has more than %d elements, exceeding the safety limit", maxSVGElements)
+			}
+			tag := strings.ToLower(t.Name.Local)
+			if !sawRoot {
+				if tag != "svg" {
+					return errors.New("SVG root element is not <svg>")
+				}
+				sawRoot = true
+			}
+			if dangerousSVGTags[tag] {
+				return fmt.Errorf("SVG contains a <%s> element, which is not accepted", t.Name.Local)
+			}
+			if tag == "style" {
+				inStyle = true
+			}
+			for _, a := range t.Attr {
+				name := strings.ToLower(a.Name.Local)
+				if strings.HasPrefix(name, "on") {
+					return fmt.Errorf("SVG contains an inline event-handler attribute (%s), which is not accepted", name)
+				}
+				if strings.HasPrefix(strings.ToLower(strings.TrimSpace(a.Value)), "javascript:") {
+					return errors.New("SVG contains a javascript: URI, which is not accepted")
+				}
+				if name == "href" && !isSafeSVGHref(a.Value) {
+					return errors.New("SVG contains a href/xlink:href reference to something other than a local #fragment or an inline data: URI, which is not accepted")
+				}
+				if name == "style" {
+					if err := validateCSSForPDF(a.Value); err != nil {
+						return err
+					}
+				}
+			}
+		case xml.EndElement:
+			if strings.ToLower(t.Name.Local) == "style" {
+				inStyle = false
+			}
+		case xml.CharData:
+			if inStyle {
+				if err := validateCSSForPDF(string(t)); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if !sawRoot {
+		return errors.New("SVG has no root <svg> element")
 	}
 	return nil
 }

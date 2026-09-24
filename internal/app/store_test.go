@@ -3,7 +3,9 @@ package app
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestReadWithRetryRetriesTransientErrorsThenSucceeds proves readJobState's
@@ -65,5 +67,67 @@ func TestReadWithRetryGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("expected exactly 3 attempts, got %d", calls)
+	}
+}
+
+// TestRenameWithRetrySucceedsPastConcurrentReader reproduces, with a real
+// file and a real concurrent reader (not a mocked error function—
+// renameWithRetry wraps os.Rename directly, unlike readWithRetry's
+// injectable read func), the exact Windows condition persist() hits
+// under load: os.Rename onto a destination another goroutine currently
+// has open for reading fails with "Access is denied" until that reader
+// closes it. Found by instrumenting store.persist's own os.Rename call
+// and running the real SVG->PNG worker pipeline test (svg_test.go's
+// TestSVGJobFlowsThroughWorker) under `go test -race`, where SVG's
+// near-instant conversion time packs several persist() calls close
+// together against a 10ms-interval HTTP status poll also reading
+// job.json—reproducing "Access is denied" on nearly every run before
+// this fix. This test pins the fix down directly against the real OS
+// rename behavior, independent of that timing-sensitive full pipeline.
+func TestRenameWithRetrySucceedsPastConcurrentReader(t *testing.T) {
+	dir := t.TempDir()
+	oldpath := filepath.Join(dir, "state.json.tmp")
+	newpath := filepath.Join(dir, "state.json")
+	if err := os.WriteFile(newpath, []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldpath, []byte("new"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(newpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := make(chan struct{})
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		_ = f.Close()
+		close(closed)
+	}()
+	if err := renameWithRetry(oldpath, newpath); err != nil {
+		t.Fatalf("expected the rename to eventually succeed once the reader closed, got: %v", err)
+	}
+	<-closed
+	data, err := os.ReadFile(newpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "new" {
+		t.Fatalf("expected the renamed content to win, got %q", data)
+	}
+}
+
+// TestRenameWithRetryGivesUpOnPersistentFailure proves a genuinely
+// unrecoverable rename (destination directory doesn't exist) still
+// surfaces an error instead of retrying forever.
+func TestRenameWithRetryGivesUpOnPersistentFailure(t *testing.T) {
+	dir := t.TempDir()
+	oldpath := filepath.Join(dir, "state.json.tmp")
+	if err := os.WriteFile(oldpath, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := renameWithRetry(oldpath, filepath.Join(dir, "no-such-subdir", "state.json"))
+	if err == nil {
+		t.Fatal("expected a rename into a nonexistent directory to fail")
 	}
 }
