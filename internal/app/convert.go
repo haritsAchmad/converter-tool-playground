@@ -14,6 +14,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"math"
 	"net/url"
 	"os"
 	"os/exec"
@@ -298,7 +299,7 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 		return convertImageToPDF(inPath, outPath)
 	}
 	if in == "svg" {
-		return convertSVG(out, inPath, outPath)
+		return convertSVG(ctx, out, inPath, outPath)
 	}
 	if imageFormats[in] {
 		return c.convertImage(ctx, in, out, inPath, outPath)
@@ -1009,8 +1010,25 @@ const defaultSVGCanvasSize = 512
 // fetch anything through it. This holds independently of validateSVG,
 // by construction of the library, not because validateSVG is trusted to
 // have already caught everything.
-func convertSVG(out, inPath, outPath string) error {
+func convertSVG(ctx context.Context, out, inPath, outPath string) (err error) {
+	// oksvg's parser is not panic-safe on hostile attribute values (temuan
+	// review P1: fill="hsl(0,,)" passes validateSVG, then ReadIcon panics
+	// with "slice bounds out of range [:-1]"), and a panic here runs on a
+	// worker goroutine, where it would take down the whole worker process
+	// rather than fail the one job. Same pattern as convertPDFToDocx.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("SVG rendering panicked: %v", r)
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	icon, err := oksvg.ReadIcon(inPath)
+	if err != nil {
+		return fmt.Errorf("could not parse SVG: %w", err)
+	}
+	root, err := readSVGRootSize(inPath)
 	if err != nil {
 		return fmt.Errorf("could not parse SVG: %w", err)
 	}
@@ -1022,23 +1040,49 @@ func convertSVG(out, inPath, outPath string) error {
 	// viewBox="0 0 4294967296 4294967296" makes int64(w)*int64(h) wrap to
 	// exactly 0 mod 2^64, sailing past the check below before it panics
 	// image.NewRGBA on the actual huge dimensions—confirmed by
-	// reproducing the panic directly). Bounding each declared dimension
+	// reproducing the panic directly). Bounding each canvas dimension
 	// individually by maxImageDecodedPixels first guarantees w and h are
 	// both small enough (<=1e8) that int64(w)*int64(h) below (<=1e16)
 	// can never overflow int64 (max ~9.2e18) regardless of aspect ratio.
-	vw, vh := icon.ViewBox.W, icon.ViewBox.H
-	declared := vw > 0 && vh > 0
-	if declared && (vw > maxImageDecodedPixels || vh > maxImageDecodedPixels) {
+	vb := icon.ViewBox
+	if root.viewBox[2] > 0 && root.viewBox[3] > 0 {
+		// oksvg stops reading the root's attributes at the first one it
+		// cannot parse, so width="100%" listed before viewBox loses the
+		// viewBox entirely; the independently parsed one wins.
+		vb.X, vb.Y, vb.W, vb.H = root.viewBox[0], root.viewBox[1], root.viewBox[2], root.viewBox[3]
+	}
+	hasViewBox := vb.W > 0 && vb.H > 0
+	cw, ch := svgCanvasSize(root.width, root.height, vb.W, vb.H)
+	declared := cw > 0 && ch > 0
+	if declared && (cw > maxImageDecodedPixels || ch > maxImageDecodedPixels) {
 		return errors.New("SVG canvas dimensions exceed the safety limit")
 	}
 	w, h := defaultSVGCanvasSize, defaultSVGCanvasSize
 	if declared {
-		w, h = int(vw), int(vh)
-		icon.SetTarget(0, 0, float64(w), float64(h))
+		w, h = max(int(math.Round(cw)), 1), max(int(math.Round(ch)), 1)
+	}
+	if declared && hasViewBox {
+		// The canvas is the viewport (width/height); the viewBox only maps
+		// SVG user space onto it (temuan review P2: width="200"
+		// height="100" viewBox="0 0 20 10" used to render 20x10).
+		// Uniform "xMidYMid meet" scaling is the SVG default;
+		// preserveAspectRatio="none" stretches. Other alignments are
+		// treated as the default. The transform is built here rather than
+		// with icon.SetTarget, which translates by -viewBox.X/Y BEFORE
+		// scaling and so misplaces content whenever the viewBox has a
+		// non-zero origin and the scale is not 1.
+		sx, sy := float64(w)/vb.W, float64(h)/vb.H
+		tx, ty := 0.0, 0.0
+		if !root.stretch {
+			s := min(sx, sy)
+			tx, ty = (float64(w)-vb.W*s)/2, (float64(h)-vb.H*s)/2
+			sx, sy = s, s
+		}
+		icon.Transform = rasterx.Identity.Translate(tx, ty).Scale(sx, sy).Translate(-vb.X, -vb.Y)
 	}
 	// Same decompression-bomb-shaped ceiling as an ordinary PNG/JPEG
 	// upload's declared dimensions (maxImageDecodedPixels)—a hostile SVG
-	// can declare an arbitrarily large viewBox just as freely as a PNG
+	// can declare an arbitrarily large viewport just as freely as a PNG
 	// header can lie about its dimensions, and the raster canvas below is
 	// allocated eagerly at this size regardless of how little the SVG
 	// actually draws into it. w and h are both already bounded to
@@ -1057,7 +1101,20 @@ func convertSVG(out, inPath, outPath string) error {
 	}
 	scanner := rasterx.NewScannerGV(w, h, img, img.Bounds())
 	raster := rasterx.NewDasher(w, h, scanner)
-	icon.Draw(raster, 1.0)
+	// Drawn path by path (what icon.Draw does internally) so a job
+	// timeout or cancellation is noticed between paths instead of only
+	// after the whole image is rasterized (temuan review P2: ctx never
+	// reached convertSVG, so a timed-out job could still be reported
+	// Completed).
+	for _, path := range icon.SVGPaths {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		path.DrawTransformed(raster, 1.0, icon.Transform)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
@@ -1065,9 +1122,125 @@ func convertSVG(out, inPath, outPath string) error {
 	}
 	defer outFile.Close()
 	if out == "png" {
-		return png.Encode(outFile, img)
+		err = png.Encode(outFile, img)
+	} else {
+		err = jpeg.Encode(outFile, img, &jpeg.Options{Quality: 90})
 	}
-	return jpeg.Encode(outFile, img, &jpeg.Options{Quality: 90})
+	if err != nil {
+		return err
+	}
+	// Encoding a large canvas takes real time; a deadline that passed
+	// meanwhile still fails the job (the caller removes the output).
+	return ctx.Err()
+}
+
+// svgRootSize is the root <svg> element's declared viewport. width and
+// height are in CSS pixels, 0 when absent or not an absolute length.
+type svgRootSize struct {
+	width, height float64
+	viewBox       [4]float64 // x, y, w, h; all zero when absent or invalid
+	stretch       bool       // preserveAspectRatio="none"
+}
+
+// readSVGRootSize reads only the root element's width, height, viewBox, and
+// preserveAspectRatio: oksvg discards width/height whenever a viewBox is
+// present, and can lose the viewBox itself (see convertSVG).
+func readSVGRootSize(path string) (svgRootSize, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return svgRootSize{}, err
+	}
+	defer f.Close()
+	dec := xml.NewDecoder(f)
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return svgRootSize{}, err
+		}
+		start, ok := tok.(xml.StartElement)
+		if !ok {
+			continue
+		}
+		var size svgRootSize
+		if start.Name.Local != "svg" {
+			return size, nil
+		}
+		for _, attr := range start.Attr {
+			switch attr.Name.Local {
+			case "width":
+				size.width = svgAbsoluteLength(attr.Value)
+			case "height":
+				size.height = svgAbsoluteLength(attr.Value)
+			case "viewBox":
+				size.viewBox = parseSVGViewBox(attr.Value)
+			case "preserveAspectRatio":
+				size.stretch = strings.HasPrefix(strings.TrimSpace(attr.Value), "none")
+			}
+		}
+		return size, nil
+	}
+}
+
+// parseSVGViewBox parses "x y w h" (space and/or comma separated). Anything
+// other than four finite numbers with positive w and h is all zeros.
+func parseSVGViewBox(value string) [4]float64 {
+	var vb [4]float64
+	fields := strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' || r == '\r' })
+	if len(fields) != 4 {
+		return [4]float64{}
+	}
+	for i, field := range fields {
+		n, err := strconv.ParseFloat(field, 64)
+		if err != nil || math.IsNaN(n) || math.IsInf(n, 0) {
+			return [4]float64{}
+		}
+		vb[i] = n
+	}
+	if vb[2] <= 0 || vb[3] <= 0 {
+		return [4]float64{}
+	}
+	return vb
+}
+
+// svgLengthUnits converts absolute CSS units to pixels at 96 DPI.
+var svgLengthUnits = map[string]float64{"": 1, "px": 1, "pt": 96.0 / 72, "pc": 16, "in": 96, "cm": 96 / 2.54, "mm": 96 / 25.4}
+
+// svgAbsoluteLength parses an SVG length such as "200", "200px", or "2in"
+// into pixels. Relative units ("100%", "em") and anything invalid,
+// non-finite, or non-positive return 0, meaning "use the viewBox".
+func svgAbsoluteLength(value string) float64 {
+	value = strings.TrimSpace(value)
+	i := len(value)
+	for i > 0 && (value[i-1] < '0' || value[i-1] > '9') && value[i-1] != '.' {
+		i--
+	}
+	scale, ok := svgLengthUnits[strings.ToLower(value[i:])]
+	if !ok {
+		return 0
+	}
+	n, err := strconv.ParseFloat(value[:i], 64)
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 {
+		return 0
+	}
+	return n * scale
+}
+
+// svgCanvasSize picks the raster canvas: the declared width/height when
+// both exist, one of them plus the viewBox aspect ratio, the viewBox size
+// itself, or (0, 0) when nothing usable is declared (defaultSVGCanvasSize).
+func svgCanvasSize(width, height, vbW, vbH float64) (float64, float64) {
+	hasViewBox := vbW > 0 && vbH > 0
+	switch {
+	case width > 0 && height > 0:
+		return width, height
+	case width > 0 && hasViewBox:
+		return width, width * vbH / vbW
+	case height > 0 && hasViewBox:
+		return height * vbW / vbH, height
+	case hasViewBox:
+		return vbW, vbH
+	}
+	return 0, 0
 }
 
 // audioOutputEncoder maps each accepted output container to the specific

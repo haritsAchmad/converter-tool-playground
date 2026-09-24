@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"encoding/json"
 	"image"
 	"image/png"
@@ -128,7 +129,7 @@ func TestConvertSVGRealRaster(t *testing.T) {
 	for _, out := range []string{"png", "jpeg"} {
 		t.Run(out, func(t *testing.T) {
 			outPath := filepath.Join(dir, "out."+out)
-			if err := convertSVG(out, inPath, outPath); err != nil {
+			if err := convertSVG(context.Background(), out, inPath, outPath); err != nil {
 				t.Fatalf("convertSVG failed: %v", err)
 			}
 			f, err := os.Open(outPath)
@@ -168,7 +169,7 @@ func TestConvertSVGFallsBackWithoutViewBox(t *testing.T) {
 		t.Fatal(err)
 	}
 	outPath := filepath.Join(dir, "out.png")
-	if err := convertSVG("png", inPath, outPath); err != nil {
+	if err := convertSVG(context.Background(), "png", inPath, outPath); err != nil {
 		t.Fatalf("convertSVG failed: %v", err)
 	}
 	f, err := os.Open(outPath)
@@ -201,7 +202,7 @@ func TestConvertSVGParsesPixelUnitSuffix(t *testing.T) {
 		t.Fatal(err)
 	}
 	outPath := filepath.Join(dir, "out.png")
-	if err := convertSVG("png", inPath, outPath); err != nil {
+	if err := convertSVG(context.Background(), "png", inPath, outPath); err != nil {
 		t.Fatalf("convertSVG failed: %v", err)
 	}
 	f, err := os.Open(outPath)
@@ -229,7 +230,7 @@ func TestConvertSVGRejectsOversizedCanvas(t *testing.T) {
 	if err := os.WriteFile(inPath, []byte(svg), 0600); err != nil {
 		t.Fatal(err)
 	}
-	err := convertSVG("png", inPath, filepath.Join(dir, "out.png"))
+	err := convertSVG(context.Background(), "png", inPath, filepath.Join(dir, "out.png"))
 	if err == nil {
 		t.Fatal("expected an oversized SVG canvas to be rejected")
 	}
@@ -255,7 +256,7 @@ func TestConvertSVGRejectsOverflowingViewBoxWithoutPanicking(t *testing.T) {
 	if err := os.WriteFile(inPath, []byte(svg), 0600); err != nil {
 		t.Fatal(err)
 	}
-	err := convertSVG("png", inPath, filepath.Join(dir, "out.png"))
+	err := convertSVG(context.Background(), "png", inPath, filepath.Join(dir, "out.png"))
 	if err == nil {
 		t.Fatal("expected an overflow-triggering viewBox to be rejected")
 	}

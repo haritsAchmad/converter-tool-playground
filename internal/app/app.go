@@ -437,7 +437,7 @@ func (a *App) process(index int, j *Job) bool {
 	_ = os.Remove(j.OutputPath)
 	ctx, cancel := context.WithTimeout(a.ctx, a.cfg.JobTimeout)
 	defer cancel()
-	err := a.converter.run(ctx, j.InputFormat, j.OutputFormat, j.PDFMode, j.InputPath, j.OutputPath)
+	err := a.runConversion(ctx, j)
 	now := time.Now().UTC()
 	j.update(func(x *Job) {
 		x.FinishedAt = &now
@@ -463,6 +463,23 @@ func (a *App) process(index int, j *Job) bool {
 	}
 	return true
 }
+
+// runConversion turns a panic anywhere in the converter call chain into an
+// ordinary failed job. HTTP handlers already have recoverer, but workers
+// call converter.run on their own goroutine, where an unrecovered panic
+// kills the whole worker process (temuan review P1: a hostile SVG fill
+// value panicked inside oksvg). convertSVG and convertPDFToDocx recover
+// their own parser panics too; this is the backstop for every other
+// converter and any parser this project hasn't audited yet.
+func (a *App) runConversion(ctx context.Context, j *Job) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("conversion panicked: %v", r)
+		}
+	}()
+	return a.converter.run(ctx, j.InputFormat, j.OutputFormat, j.PDFMode, j.InputPath, j.OutputPath)
+}
+
 func (a *App) janitor() {
 	defer a.wg.Done()
 	ticker := time.NewTicker(a.cfg.CleanupInterval)
