@@ -378,7 +378,7 @@ func (c *converter) convertPDF(ctx context.Context, out, inPath, outPath string)
 	if len(pages) == 0 {
 		return errors.New("PDF rendering produced no output (empty or encrypted PDF?)")
 	}
-	if err := zipRenderedPages(outPath, pages, ext); err != nil {
+	if err := zipRenderedPages(ctx, outPath, pages, ext); err != nil {
 		return err
 	}
 	for _, p := range pages {
@@ -419,7 +419,14 @@ func renderedPDFPages(root, ext string) ([]renderedPDFPage, error) {
 	return pages, nil
 }
 
-func zipRenderedPages(outPath string, pages []renderedPDFPage, ext string) (err error) {
+// zipRenderedPages packages every rendered page into outPath. It checks ctx
+// before each page instead of only relying on pdftoppm's own ctx-bound
+// process exiting: without this, cancelling or timing out a job only
+// stopped pdftoppm, while the zip loop kept copying however many hundreds
+// of already-rendered pages remained (temuan review P2), holding the
+// worker past its deadline and risking a job that still gets reported
+// successful after it should have been killed.
+func zipRenderedPages(ctx context.Context, outPath string, pages []renderedPDFPage, ext string) (err error) {
 	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
@@ -436,6 +443,9 @@ func zipRenderedPages(outPath string, pages []renderedPDFPage, ext string) (err 
 		}
 	}()
 	for _, p := range pages {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
 		if err = copyIntoZip(zw, p, ext); err != nil {
 			return err
 		}

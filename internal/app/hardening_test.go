@@ -347,6 +347,60 @@ func TestReloadAndDownloadAcceptLegacyPDFToImageOutput(t *testing.T) {
 	}
 }
 
+// TestReloadMigratesLegacyExtensionForUnfinishedPDFToImageJob is the
+// regression the poison-pill/legacy-extension review finding asked for: a
+// PDF->PNG/JPEG job created before multi-page rendering shipped and still
+// Queued or Processing at upgrade time has no real output file under any
+// extension yet—the worker always writes a ZIP once it runs. reload() must
+// migrate such a job's recorded name/path to today's ".zip" convention
+// instead of trusting the legacy ".png"/".jpg" extension the way it does
+// for an already-Completed job (TestReloadAndDownloadAcceptLegacyPDFToImageOutput);
+// otherwise the worker would write today's ZIP bytes into a file still
+// named "output.png"/"output.jpg", producing a download that claims to be
+// an image but isn't one.
+func TestReloadMigratesLegacyExtensionForUnfinishedPDFToImageJob(t *testing.T) {
+	ids := map[Status]string{Queued: "66666666-6666-6666-6666-666666666666", Processing: "77777777-7777-7777-7777-777777777777"}
+	for status, id := range ids {
+		t.Run(string(status), func(t *testing.T) {
+			root := t.TempDir()
+			s, err := newStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := filepath.Join(root, id)
+			if err := os.MkdirAll(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			inputPath := filepath.Join(dir, "input.bin")
+			if err := os.WriteFile(inputPath, []byte(minimalPDF), 0600); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			j := &Job{
+				ID: id, Status: status, InputFormat: "pdf", OutputFormat: "png",
+				OriginalName: "doc.pdf", OutputName: "report.png",
+				CreatedAt: now, ExpiresAt: now.Add(time.Hour),
+				InputPath: inputPath, mu: &sync.RWMutex{},
+			}
+			s.add(j)
+			if err := s.persist(j); err != nil {
+				t.Fatal(err)
+			}
+			loaded, ok := s.reload(id)
+			if !ok {
+				t.Fatalf("reload rejected a %s PDF->PNG job with a legacy .png OutputName", status)
+			}
+			wantPath := filepath.Join(dir, "output.zip")
+			if loaded.OutputPath != wantPath {
+				t.Fatalf("expected OutputPath %q, got %q", wantPath, loaded.OutputPath)
+			}
+			if loaded.OutputName != "report.zip" {
+				t.Fatalf("expected OutputName migrated to report.zip, got %q", loaded.OutputName)
+			}
+		})
+	}
+}
+
 func TestRateLimitRejectsBurstOverflow(t *testing.T) {
 	cfg := Config{Address: ":0", StorageRoot: t.TempDir(), MaxUploadBytes: 1 << 20, Workers: 1, QueueSize: 10, JobTimeout: time.Second, JobTTL: time.Minute, CleanupInterval: time.Hour, UploadTimeout: time.Second, RateRPS: 1, RateBurst: 1, MaxJobsPerIP: 100}
 	a, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))

@@ -146,14 +146,32 @@ func (s *store) reload(id string) (*Job, bool) {
 	matched := ext
 	if !strings.HasSuffix(name, ext) {
 		matched = ""
-		for _, legacy := range legacyOutputExtensions(loaded.InputFormat, loaded.OutputFormat) {
-			if strings.HasSuffix(name, legacy) {
-				matched = legacy
-				break
+		// A legacy on-disk extension can only be trusted for a job that
+		// already finished under the old convention: a real file was
+		// written under that name and will never be rewritten. A job still
+		// queued or processing has no output file yet, and the worker
+		// always produces today's extension when it eventually runs, so its
+		// recorded name is migrated to match instead of being chased under
+		// a name the worker will never actually write (temuan review P2:
+		// this previously accepted the legacy extension regardless of
+		// status, so an old queued/processing PDF->image job kept an
+		// "output.png"/"output.jpg" path while the worker wrote today's ZIP
+		// bytes into it, producing a download that claimed to be an image
+		// but wasn't one).
+		if loaded.Status == Completed {
+			for _, legacy := range legacyOutputExtensions(loaded.InputFormat, loaded.OutputFormat) {
+				if strings.HasSuffix(name, legacy) {
+					matched = legacy
+					break
+				}
 			}
 		}
 		if matched == "" {
-			return nil, false
+			if loaded.Status == Completed {
+				return nil, false
+			}
+			matched = ext
+			loaded.OutputName = strings.TrimSuffix(loaded.OutputName, filepath.Ext(loaded.OutputName)) + ext
 		}
 	}
 	loaded.OutputPath = filepath.Join(dir, "output"+matched)

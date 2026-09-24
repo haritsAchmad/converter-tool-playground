@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
@@ -230,12 +231,41 @@ func TestZipRenderedPagesRoundTrip(t *testing.T) {
 		}
 	}
 	outPath := filepath.Join(dir, "out.zip")
-	if err := zipRenderedPages(outPath, pages, "png"); err != nil {
+	if err := zipRenderedPages(context.Background(), outPath, pages, "png"); err != nil {
 		t.Fatal(err)
 	}
 	names := zipEntryNames(t, outPath)
 	if len(names) != 2 || names[0] != "page-1.png" || names[1] != "page-2.png" {
 		t.Fatalf("expected page-1.png, page-2.png, got %v", names)
+	}
+}
+
+// TestZipRenderedPagesStopsOnCancelledContext proves zipRenderedPages checks
+// ctx between pages instead of running the whole archive to completion once
+// started: a cancelled context must stop the loop before it copies any page,
+// so a timed-out/cancelled job can't keep a worker busy zipping hundreds of
+// already-rendered pages past its deadline (temuan review P2).
+func TestZipRenderedPagesStopsOnCancelledContext(t *testing.T) {
+	dir := t.TempDir()
+	pages := []renderedPDFPage{
+		{number: 1, path: filepath.Join(dir, "root-1.png")},
+		{number: 2, path: filepath.Join(dir, "root-2.png")},
+	}
+	for i, p := range pages {
+		if err := os.WriteFile(p.path, []byte{byte(i), 'x'}, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	outPath := filepath.Join(dir, "out.zip")
+	err := zipRenderedPages(ctx, outPath, pages, "png")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	names := zipEntryNames(t, outPath)
+	if len(names) != 0 {
+		t.Fatalf("expected no pages copied after cancellation, got %v", names)
 	}
 }
 
