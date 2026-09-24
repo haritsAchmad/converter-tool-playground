@@ -13,6 +13,25 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # LibreOffice/ffmpeg/poppler-utils gate a large slice of this
+      # codebase's own test suite behind an exec.LookPath check (Office/
+      # ODF/Markdown-HTML→PDF via LibreOffice, PDF→image via pdftoppm,
+      # audio/video via ffmpeg/ffprobe)—without them installed here,
+      # every one of those tests silently self-skips instead of actually
+      # running, which is exactly what this job did before this step
+      # existed. Same package set the production Dockerfile installs
+      # (minus imagemagick: Ubuntu's apt-packaged ImageMagick is v6,
+      # which provides `convert`, not the `magick` binary this codebase
+      # specifically looks for, and there's no simple, low-maintenance
+      # apt source for IM7 on this runner—WebP conversion tests still
+      # self-skip here, same as before this step).
+      - name: Install LibreOffice/ffmpeg/poppler for real-tool tests
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libreoffice-writer libreoffice-calc libreoffice-impress \
+            ffmpeg poppler-utils \
+            fonts-liberation fonts-dejavu fonts-noto-core
       - run: go test -race ./...
       - run: go vet ./...
       - run: go build ./cmd/convertbox
