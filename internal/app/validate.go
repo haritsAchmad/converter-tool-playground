@@ -124,6 +124,26 @@ func validateUpload(path, original string) (string, error) {
 		if !isMP3Signature(head) {
 			return "", errors.New("extension and MP3 signature do not match")
 		}
+	case "mp4":
+		// The ISO base media file format signature (also covers MOV/M4A/
+		// 3GP): a 4-byte box size, then a literal "ftyp" box type at
+		// offset 4—verified against Go's own net/http sniffer (sniff.go's
+		// mp4Sig), which additionally scans the brand list within that
+		// box for a literal "mp4" substring before reporting video/mp4;
+		// this check is deliberately looser (ffprobe's forced -f mp4 parse
+		// is the authoritative check), which is also why mimeAllowed
+		// accepts application/octet-stream for mp4 alongside video/mp4—
+		// not every real MP4's brand list matches Go's stricter scan.
+		if len(head) < 8 || string(head[4:8]) != "ftyp" {
+			return "", errors.New("extension and MP4 signature do not match")
+		}
+	case "webm":
+		// The EBML magic number WebM (a Matroska profile) always starts
+		// with—verified against Go's own net/http sniffer, which uses this
+		// same exact 4-byte match for "video/webm".
+		if !bytes.HasPrefix(head, []byte{0x1A, 0x45, 0xDF, 0xA3}) {
+			return "", errors.New("extension and WebM signature do not match")
+		}
 	default:
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
 			return "", errors.New("text input must be valid UTF-8 without NUL bytes")
@@ -180,6 +200,9 @@ func validateSyntax(format, path string) error {
 	}
 	if audioFormats[format] {
 		return validateAudio(format, path)
+	}
+	if videoFormats[format] {
+		return validateVideo(format, path)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -290,6 +313,8 @@ type ffprobeOutput struct {
 type ffprobeStream struct {
 	CodecName   string         `json:"codec_name"`
 	CodecType   string         `json:"codec_type"`
+	Width       int            `json:"width"`
+	Height      int            `json:"height"`
 	Disposition map[string]int `json:"disposition"`
 }
 type ffprobeFormat struct {
@@ -314,7 +339,7 @@ func isMP3Signature(head []byte) bool {
 
 // validateAudio probes path with ffprobe (using the same protocol-
 // whitelist/format-forcing/probe-size hardening flags as the real
-// conversion—see audioProbeArgs in convert.go, which deliberately
+// conversion—see ffmpegHardeningArgs in convert.go, which deliberately
 // excludes ffmpeg-CLI-only flags like -nostdin that ffprobe doesn't
 // recognize) and rejects it unless validateAudioStreams accepts the
 // result. Looks up ffprobe itself
@@ -328,7 +353,7 @@ func validateAudio(format, path string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), audioProbeTimeout)
 	defer cancel()
-	args := append([]string{}, audioProbeArgs...)
+	args := append([]string{}, ffmpegHardeningArgs...)
 	args = append(args, "-f", format, "-i", path, "-show_streams", "-show_format", "-of", "json")
 	cmd := exec.CommandContext(ctx, ffprobe, args...)
 	cmd.Env = []string{"PATH=" + filepath.Dir(ffprobe)}
@@ -381,6 +406,111 @@ func validateAudioStreams(format string, probe ffprobeOutput) error {
 	}
 	if duration <= 0 || duration > maxAudioDurationSeconds {
 		return fmt.Errorf("audio duration of %.0fs is invalid or exceeds the %ds limit", duration, maxAudioDurationSeconds)
+	}
+	return nil
+}
+
+// videoCodecWhitelist is the closed set of codecs accepted inside each
+// videoFormats container, split by stream type, keyed by ffprobe's own
+// codec_name. libx264/libvpx-vp9/libopus availability was confirmed
+// directly against this project's own alpine:3.22 ffmpeg-libavcodec
+// package dependencies (see videoOutputEncoder in convert.go)—vp8 is
+// accepted as legitimate INPUT even though this codebase always encodes
+// NEW webm OUTPUT as vp9 (the same asymmetry audio already has for ogg,
+// which accepts vorbis/opus/flac in but only ever writes vorbis out).
+var videoCodecWhitelist = map[string]struct{ video, audio map[string]bool }{
+	"mp4":  {video: map[string]bool{"h264": true}, audio: map[string]bool{"aac": true}},
+	"webm": {video: map[string]bool{"vp8": true, "vp9": true}, audio: map[string]bool{"opus": true, "vorbis": true}},
+}
+
+const (
+	// Duration and resolution ceilings for video input, checked against
+	// ffprobe's own reported values before conversion—much tighter than
+	// audio's (4 hours, no resolution bound at all): video transcoding is
+	// far more CPU-expensive per second of content than audio, and this
+	// codebase deliberately doesn't add a video-specific job-timeout
+	// config in this first slice, so a job needs to stay small enough to
+	// plausibly finish within the existing (audio/document-sized) job
+	// timeout model instead. 720p keeps the pixel count (and therefore
+	// per-frame encode cost) bounded regardless of aspect ratio; 60
+	// seconds keeps the frame count bounded. Operators enabling video
+	// should still budget CONVERTBOX_JOB_TIMEOUT accordingly--even within
+	// these caps, encode time depends on content complexity and available
+	// CPU, not just duration and resolution.
+	maxVideoDurationSeconds = 60
+	maxVideoPixels          = 1280 * 720
+)
+
+// validateVideo probes path with ffprobe (using the same hardening flags
+// as validateAudio) and rejects it unless validateVideoStreams accepts
+// the result.
+func validateVideo(format, path string) error {
+	ffprobe, err := exec.LookPath("ffprobe")
+	if err != nil {
+		return errors.New("video validation is not available")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), audioProbeTimeout)
+	defer cancel()
+	args := append([]string{}, ffmpegHardeningArgs...)
+	args = append(args, "-f", format, "-i", path, "-show_streams", "-show_format", "-of", "json")
+	cmd := exec.CommandContext(ctx, ffprobe, args...)
+	cmd.Env = []string{"PATH=" + filepath.Dir(ffprobe)}
+	stdout, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("invalid video structure: %w", err)
+	}
+	var probe ffprobeOutput
+	if err := json.Unmarshal(stdout, &probe); err != nil {
+		return fmt.Errorf("could not parse video probe output: %w", err)
+	}
+	return validateVideoStreams(format, probe)
+}
+
+// validateVideoStreams is validateVideo's decision logic, factored out as
+// a pure function for the same reason validateAudioStreams is: unit
+// testable against hand-written fixtures without needing a real ffprobe
+// binary. Accepts exactly one video stream (codec on videoCodecWhitelist,
+// declared pixel count within maxVideoPixels) and at most one audio
+// stream (codec on videoCodecWhitelist, if present at all--a silent,
+// video-only file is valid). Unlike audio, there's no attached-picture
+// exception: that's an audio/cover-art convention, not an established one
+// for these video containers, so any subtitle, data, or extra stream of
+// any kind is rejected outright. Also enforces maxVideoDurationSeconds
+// against the container's own reported duration.
+func validateVideoStreams(format string, probe ffprobeOutput) error {
+	allowed := videoCodecWhitelist[format]
+	videoStreams, audioStreams := 0, 0
+	for _, s := range probe.Streams {
+		switch s.CodecType {
+		case "video":
+			videoStreams++
+			if !allowed.video[s.CodecName] {
+				return fmt.Errorf("video codec %q is not accepted for %s input", s.CodecName, format)
+			}
+			if s.Width <= 0 || s.Height <= 0 || s.Width*s.Height > maxVideoPixels {
+				return fmt.Errorf("video resolution %dx%d is invalid or exceeds the %d pixel limit", s.Width, s.Height, maxVideoPixels)
+			}
+		case "audio":
+			audioStreams++
+			if !allowed.audio[s.CodecName] {
+				return fmt.Errorf("audio codec %q is not accepted for %s input", s.CodecName, format)
+			}
+		default:
+			return fmt.Errorf("video file contains a %s stream, which is not accepted", s.CodecType)
+		}
+	}
+	if videoStreams != 1 {
+		return fmt.Errorf("expected exactly one video stream, found %d", videoStreams)
+	}
+	if audioStreams > 1 {
+		return fmt.Errorf("expected at most one audio stream, found %d", audioStreams)
+	}
+	duration, err := strconv.ParseFloat(probe.Format.Duration, 64)
+	if err != nil {
+		return errors.New("could not determine video duration")
+	}
+	if duration <= 0 || duration > maxVideoDurationSeconds {
+		return fmt.Errorf("video duration of %.0fs is invalid or exceeds the %ds limit", duration, maxVideoDurationSeconds)
 	}
 	return nil
 }
@@ -1053,6 +1183,20 @@ func mimeAllowed(format, mime string) bool {
 			return mime == "application/octet-stream"
 		case "ogg":
 			return mime == "application/ogg" || mime == "application/octet-stream"
+		}
+	}
+	if videoFormats[format] {
+		// Verified against Go's own net/http sniffer: WebM's EBML magic is
+		// an exact-match signature, always recognized as "video/webm"; MP4
+		// detection additionally scans the ftyp box's brand list for a
+		// literal "mp4" substring, which not every real MP4 file's brand
+		// list satisfies, so "application/octet-stream" is accepted for it
+		// too rather than only the one "proper" MIME type.
+		switch format {
+		case "mp4":
+			return mime == "video/mp4" || mime == "application/octet-stream"
+		case "webm":
+			return mime == "video/webm" || mime == "application/octet-stream"
 		}
 	}
 	return strings.HasPrefix(mime, "text/") || mime == "application/json" || mime == "application/xml" || mime == "application/octet-stream"

@@ -45,17 +45,17 @@ func tinyWAV(t *testing.T, seconds float64) []byte {
 	return buf.Bytes()
 }
 
-// TestAudioProbeArgsExcludeNostdin proves audioProbeArgs, shared between
-// ffmpeg (convertAudio) and ffprobe (validateAudio), never contains
-// -nostdin: it's an ffmpeg-CLI-only option ffprobe doesn't recognize, so
-// including it in the shared list made every single audio upload fail
-// ffprobe validation outright before ever reading the file (temuan review
-// P1)--convertAudio adds it separately, only to the args it actually
-// passes to ffmpeg.
-func TestAudioProbeArgsExcludeNostdin(t *testing.T) {
-	for _, arg := range audioProbeArgs {
+// TestFFmpegHardeningArgsExcludeNostdin proves ffmpegHardeningArgs, shared
+// between ffmpeg (convertAudio/convertVideo) and ffprobe (validateAudio/
+// validateVideo), never contains -nostdin: it's an ffmpeg-CLI-only option
+// ffprobe doesn't recognize, so including it in the shared list made every
+// single upload fail ffprobe validation outright before ever reading the
+// file (temuan review P1)--convertAudio/convertVideo add it separately,
+// only to the args they actually pass to ffmpeg.
+func TestFFmpegHardeningArgsExcludeNostdin(t *testing.T) {
+	for _, arg := range ffmpegHardeningArgs {
 		if arg == "-nostdin" {
-			t.Fatal("audioProbeArgs (shared with ffprobe) must not contain -nostdin, an ffmpeg-CLI-only option")
+			t.Fatal("ffmpegHardeningArgs (shared with ffprobe) must not contain -nostdin, an ffmpeg-CLI-only option")
 		}
 	}
 }

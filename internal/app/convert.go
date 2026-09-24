@@ -54,6 +54,8 @@ var formats = map[string]Format{
 	"wav":      {"wav", "WAV", "Audio", []string{".wav"}},
 	"flac":     {"flac", "FLAC", "Audio", []string{".flac"}},
 	"ogg":      {"ogg", "Ogg (Vorbis/Opus)", "Audio", []string{".ogg"}},
+	"mp4":      {"mp4", "MP4 (H.264)", "Video", []string{".mp4"}},
+	"webm":     {"webm", "WebM (VP8/VP9)", "Video", []string{".webm"}},
 }
 
 var dataFormats = map[string]bool{"csv": true, "json": true, "xml": true, "yaml": true}
@@ -67,6 +69,23 @@ var officeFormats = map[string]bool{"docx": true, "xlsx": true, "pptx": true}
 // convertAudio force -f <id> on both the input and output side instead of
 // leaving format auto-detection to content sniffing.
 var audioFormats = map[string]bool{"mp3": true, "wav": true, "flac": true, "ogg": true}
+
+// videoFormats are converted via ffmpeg/ffprobe, the same engine and
+// hardening as audioFormats (see convertVideo and validateVideo). "mp4"
+// and "webm" are muxer names ffmpeg accepts verbatim for -f on output;
+// there's no demuxer literally named either on the *input* side (the real
+// demuxers are the combined "mov,mp4,m4a,3gp,3g2,mj2" and
+// "matroska,webm"), but ffmpeg's format-name resolution accepts "mp4"/
+// "webm" as aliases into those on input too—verified empirically against
+// a real ffmpeg binary (not assumed from the -formats listing, which
+// only shows the combined demuxer names and would suggest otherwise).
+// Deliberately narrower in scope than audio: exactly one video stream, at
+// most one audio stream, no subtitle/data stream of any kind (no
+// attached-picture exception either—unlike audio, that's not an
+// established convention for these containers), a 720p pixel ceiling, and
+// a 60-second duration cap, keeping a job within reach of this project's
+// existing job-timeout model without adding video-specific config.
+var videoFormats = map[string]bool{"mp4": true, "webm": true}
 
 // odfFormats are ODF's own package family (odt/ods/odp), deliberately kept
 // separate from officeFormats: they go through the same convertOffice/
@@ -130,6 +149,9 @@ func (c *converter) supports(in, out string) bool {
 		return c.libreoffice != ""
 	}
 	if audioFormats[in] && audioFormats[out] {
+		return c.ffmpeg != "" && c.ffprobe != ""
+	}
+	if videoFormats[in] && videoFormats[out] {
 		return c.ffmpeg != "" && c.ffprobe != ""
 	}
 	if imageFormats[in] && out == "pdf" {
@@ -231,6 +253,9 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 	}
 	if audioFormats[in] && audioFormats[out] {
 		return c.convertAudio(ctx, in, out, inPath, outPath)
+	}
+	if videoFormats[in] && videoFormats[out] {
+		return c.convertVideo(ctx, in, out, inPath, outPath)
 	}
 	return convertDocument(in, out, inPath, outPath)
 }
@@ -738,15 +763,16 @@ var audioOutputEncoder = map[string][]string{
 	"ogg":  {"-c:a", "libvorbis", "-q:a", "5"},
 }
 
-// audioProbeArgs are the hardening flags shared by every ffmpeg/ffprobe
-// invocation that touches a user-supplied audio file, whether probing it
-// (validateAudio) or actually transcoding it (convertAudio). Only options
-// both tools actually recognize belong here—"-nostdin" is deliberately
-// NOT among them (temuan review P1): it's an ffmpeg-CLI-only option
-// (defined alongside ffmpeg.c's own option table, not ffprobe's), and
-// ffprobe rejects it outright, failing every single audio upload's
-// validation before it ever got to read the file. It's added separately,
-// only in convertAudio's own args, where it belongs.
+// ffmpegHardeningArgs are the hardening flags shared by every ffmpeg/
+// ffprobe invocation that touches a user-supplied audio or video file,
+// whether probing it (validateAudio/validateVideo) or actually
+// transcoding it (convertAudio/convertVideo). Only options both tools
+// actually recognize belong here—"-nostdin" is deliberately NOT among
+// them (temuan review P1): it's an ffmpeg-CLI-only option (defined
+// alongside ffmpeg.c's own option table, not ffprobe's), and ffprobe
+// rejects it outright, failing every single upload's validation before it
+// ever got to read the file. It's added separately, only in
+// convertAudio's/convertVideo's own args, where it belongs.
 //
 //   - "-protocol_whitelist file" keeps every protocol other than plain
 //     local file I/O out of reach, for both the direct input and anything
@@ -773,9 +799,9 @@ var audioOutputEncoder = map[string][]string{
 //     defaults (these have changed across ffmpeg releases)--also a
 //     libavformat concern both tools share, not ffmpeg-CLI-only.
 //   - "-v error" keeps each tool's own diagnostic chatter out of stdout,
-//     so validateAudio's JSON parse only ever sees ffprobe's actual
-//     output.
-var audioProbeArgs = []string{"-v", "error", "-protocol_whitelist", "file", "-analyzeduration", "5000000", "-probesize", "5000000"}
+//     so validateAudio's/validateVideo's JSON parse only ever sees
+//     ffprobe's actual output.
+var ffmpegHardeningArgs = []string{"-v", "error", "-protocol_whitelist", "file", "-analyzeduration", "5000000", "-probesize", "5000000"}
 
 // convertAudio transcodes in (one of audioFormats) to out via ffmpeg,
 // mapping only the input's single validated audio stream (-map 0:a:0) and
@@ -788,11 +814,12 @@ func (c *converter) convertAudio(ctx context.Context, in, out, inPath, outPath s
 	if c.ffmpeg == "" {
 		return errors.New("audio conversion is not available")
 	}
-	// -nostdin is ffmpeg-CLI-only (see audioProbeArgs's doc comment for why
-	// it isn't in the shared list)--added here, not in audioProbeArgs,
-	// since this is the one call site that's actually running ffmpeg, not
-	// ffprobe. It stops ffmpeg from ever waiting on interactive input.
-	args := append([]string{"-nostdin"}, audioProbeArgs...)
+	// -nostdin is ffmpeg-CLI-only (see ffmpegHardeningArgs's doc comment for
+	// why it isn't in the shared list)--added here, not in
+	// ffmpegHardeningArgs, since this is the one call site that's actually
+	// running ffmpeg, not ffprobe. It stops ffmpeg from ever waiting on
+	// interactive input.
+	args := append([]string{"-nostdin"}, ffmpegHardeningArgs...)
 	args = append(args, "-f", in, "-i", inPath, "-map", "0:a:0", "-vn", "-sn", "-dn")
 	args = append(args, audioOutputEncoder[out]...)
 	args = append(args, "-f", out, outPath)
@@ -802,6 +829,47 @@ func (c *converter) convertAudio(ctx context.Context, in, out, inPath, outPath s
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("audio conversion failed: %w (%s)", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+// videoOutputEncoder maps each accepted video output container to the
+// specific codecs (and a fast preset/deadline, since a job stays within
+// this project's existing job-timeout model rather than a
+// video-specific one—see videoFormats's doc comment) ffmpeg encodes it
+// with. libx264/libvpx-vp9/libopus availability was confirmed directly
+// against the exact `ffmpeg-libavcodec` package this project's own
+// `alpine:3.22` Dockerfile installs (its dependency list includes
+// libx264.so, libvpx.so, and libopus.so), not assumed. AAC uses ffmpeg's
+// own built-in encoder, no external library needed.
+var videoOutputEncoder = map[string][]string{
+	"mp4":  {"-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac"},
+	"webm": {"-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-c:a", "libopus"},
+}
+
+// convertVideo transcodes in (one of videoFormats) to out via ffmpeg,
+// reusing the same protocol-whitelist/format-forcing/probe-size hardening
+// as convertAudio (ffmpegHardeningArgs), plus the same -nostdin caveat
+// (see convertAudio's own comment). Maps the input's single validated video
+// stream and its at-most-one validated audio stream—0:a:0? rather than
+// 0:a:0, so a silent (video-only) input, valid per validateVideoStreams,
+// doesn't make ffmpeg fail looking for an audio stream that was never
+// there—and explicitly drops subtitle/data streams (-sn -dn), matching
+// validateVideoStreams's own reject-list of anything else.
+func (c *converter) convertVideo(ctx context.Context, in, out, inPath, outPath string) error {
+	if c.ffmpeg == "" {
+		return errors.New("video conversion is not available")
+	}
+	args := append([]string{"-nostdin"}, ffmpegHardeningArgs...)
+	args = append(args, "-f", in, "-i", inPath, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn")
+	args = append(args, videoOutputEncoder[out]...)
+	args = append(args, "-f", out, outPath)
+	cmd := exec.CommandContext(ctx, c.ffmpeg, args...)
+	cmd.Dir = filepath.Dir(inPath)
+	cmd.Env = []string{"PATH=" + filepath.Dir(c.ffmpeg)}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("video conversion failed: %w (%s)", err, strings.TrimSpace(string(output)))
 	}
 	return nil
 }
