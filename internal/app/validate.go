@@ -297,9 +297,12 @@ func isMP3Signature(head []byte) bool {
 	return len(head) >= 2 && head[0] == 0xFF && head[1]&0xE0 == 0xE0
 }
 
-// validateAudio probes path with ffprobe (using the same hardening flags
-// as the real conversion—see audioProbeArgs in convert.go) and rejects it
-// unless validateAudioStreams accepts the result. Looks up ffprobe itself
+// validateAudio probes path with ffprobe (using the same protocol-
+// whitelist/format-forcing/probe-size hardening flags as the real
+// conversion—see audioProbeArgs in convert.go, which deliberately
+// excludes ffmpeg-CLI-only flags like -nostdin that ffprobe doesn't
+// recognize) and rejects it unless validateAudioStreams accepts the
+// result. Looks up ffprobe itself
 // rather than taking a *converter, so this free function (like every
 // other validateX in this file) doesn't need App-level wiring threaded
 // through validateUpload/validateSyntax just for this one format family.

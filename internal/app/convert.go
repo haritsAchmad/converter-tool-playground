@@ -740,7 +740,13 @@ var audioOutputEncoder = map[string][]string{
 
 // audioProbeArgs are the hardening flags shared by every ffmpeg/ffprobe
 // invocation that touches a user-supplied audio file, whether probing it
-// (validateAudio) or actually transcoding it (convertAudio):
+// (validateAudio) or actually transcoding it (convertAudio). Only options
+// both tools actually recognize belong here—"-nostdin" is deliberately
+// NOT among them (temuan review P1): it's an ffmpeg-CLI-only option
+// (defined alongside ffmpeg.c's own option table, not ffprobe's), and
+// ffprobe rejects it outright, failing every single audio upload's
+// validation before it ever got to read the file. It's added separately,
+// only in convertAudio's own args, where it belongs.
 //
 //   - "-protocol_whitelist file" keeps every protocol other than plain
 //     local file I/O out of reach, for both the direct input and anything
@@ -749,7 +755,9 @@ var audioOutputEncoder = map[string][]string{
 //     is exactly the class of attack this closes off: without it, a file
 //     merely named "*.mp3" but structured as an HLS playlist or concat
 //     script could make ffmpeg fetch an internal http(s) URL or read an
-//     arbitrary local file the worker process can see.
+//     arbitrary local file the worker process can see. This one IS shared
+//     with ffprobe correctly: protocol whitelisting is a libavformat
+//     (AVOption) concern both tools link against, not an ffmpeg-CLI one.
 //   - "-f <format>" (appended by each caller, not here, since it differs
 //     per call) forces the exact demuxer rather than leaving format
 //     selection to ffmpeg's own content-based auto-detection, so a file
@@ -762,11 +770,12 @@ var audioOutputEncoder = map[string][]string{
 //   - "-analyzeduration"/"-probesize" bound how much of the file ffmppeg
 //     will read while determining stream parameters, pinned to explicit
 //     values rather than relying on ffmpeg's own version-dependent
-//     defaults (these have changed across ffmpeg releases).
-//   - "-nostdin" stops ffmpeg from ever waiting on interactive input, and
-//     "-v error" keeps its own diagnostic chatter out of stdout so
-//     validateAudio's JSON parse only ever sees ffprobe's actual output.
-var audioProbeArgs = []string{"-nostdin", "-v", "error", "-protocol_whitelist", "file", "-analyzeduration", "5000000", "-probesize", "5000000"}
+//     defaults (these have changed across ffmpeg releases)--also a
+//     libavformat concern both tools share, not ffmpeg-CLI-only.
+//   - "-v error" keeps each tool's own diagnostic chatter out of stdout,
+//     so validateAudio's JSON parse only ever sees ffprobe's actual
+//     output.
+var audioProbeArgs = []string{"-v", "error", "-protocol_whitelist", "file", "-analyzeduration", "5000000", "-probesize", "5000000"}
 
 // convertAudio transcodes in (one of audioFormats) to out via ffmpeg,
 // mapping only the input's single validated audio stream (-map 0:a:0) and
@@ -779,7 +788,11 @@ func (c *converter) convertAudio(ctx context.Context, in, out, inPath, outPath s
 	if c.ffmpeg == "" {
 		return errors.New("audio conversion is not available")
 	}
-	args := append([]string{}, audioProbeArgs...)
+	// -nostdin is ffmpeg-CLI-only (see audioProbeArgs's doc comment for why
+	// it isn't in the shared list)--added here, not in audioProbeArgs,
+	// since this is the one call site that's actually running ffmpeg, not
+	// ffprobe. It stops ffmpeg from ever waiting on interactive input.
+	args := append([]string{"-nostdin"}, audioProbeArgs...)
 	args = append(args, "-f", in, "-i", inPath, "-map", "0:a:0", "-vn", "-sn", "-dn")
 	args = append(args, audioOutputEncoder[out]...)
 	args = append(args, "-f", out, outPath)

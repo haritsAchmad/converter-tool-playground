@@ -45,6 +45,21 @@ func tinyWAV(t *testing.T, seconds float64) []byte {
 	return buf.Bytes()
 }
 
+// TestAudioProbeArgsExcludeNostdin proves audioProbeArgs, shared between
+// ffmpeg (convertAudio) and ffprobe (validateAudio), never contains
+// -nostdin: it's an ffmpeg-CLI-only option ffprobe doesn't recognize, so
+// including it in the shared list made every single audio upload fail
+// ffprobe validation outright before ever reading the file (temuan review
+// P1)--convertAudio adds it separately, only to the args it actually
+// passes to ffmpeg.
+func TestAudioProbeArgsExcludeNostdin(t *testing.T) {
+	for _, arg := range audioProbeArgs {
+		if arg == "-nostdin" {
+			t.Fatal("audioProbeArgs (shared with ffprobe) must not contain -nostdin, an ffmpeg-CLI-only option")
+		}
+	}
+}
+
 func TestIsMP3Signature(t *testing.T) {
 	cases := []struct {
 		name string
@@ -216,8 +231,10 @@ func TestConvertAudioReachesFFmpeg(t *testing.T) {
 
 // ffmpegLookPath skips the calling test unless both ffmpeg and ffprobe
 // are on PATH, mirroring officeLookPath's pattern for LibreOffice-
-// dependent tests. Neither is installed on this project's own Windows dev
-// machine; these tests run for real in the Docker image and CI.
+// dependent tests: neither is guaranteed to be installed on a given dev
+// machine (this project's own didn't have them until ffmpeg's -nostdin/
+// ffprobe incompatibility, temuan review P1, needed a real binary to
+// verify against), but both are always present in the Docker image and CI.
 func ffmpegLookPath(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("ffmpeg"); err != nil {
@@ -243,9 +260,9 @@ func TestValidateAudioAcceptsRealWAV(t *testing.T) {
 }
 
 // TestConvertAudioEndToEnd is the real end-to-end conversion case, skipped
-// where ffmpeg/ffprobe aren't installed (this project's own Windows dev
-// machine included, same as the LibreOffice- and poppler-dependent
-// tests), and running for real in the Docker image and CI.
+// where ffmpeg/ffprobe aren't installed, same as the LibreOffice- and
+// poppler-dependent tests, and running for real in the Docker image and
+// CI.
 func TestConvertAudioEndToEnd(t *testing.T) {
 	ffmpegLookPath(t)
 	c := newConverter()
