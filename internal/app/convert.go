@@ -47,11 +47,25 @@ var formats = map[string]Format{
 	"docx":     {"docx", "Word (DOCX)", "Office", []string{".docx"}},
 	"xlsx":     {"xlsx", "Excel (XLSX)", "Office", []string{".xlsx"}},
 	"pptx":     {"pptx", "PowerPoint (PPTX)", "Office", []string{".pptx"}},
+	"odt":      {"odt", "OpenDocument Text (ODT)", "OpenDocument", []string{".odt"}},
+	"ods":      {"ods", "OpenDocument Spreadsheet (ODS)", "OpenDocument", []string{".ods"}},
+	"odp":      {"odp", "OpenDocument Presentation (ODP)", "OpenDocument", []string{".odp"}},
 }
 
 var dataFormats = map[string]bool{"csv": true, "json": true, "xml": true, "yaml": true}
 var imageFormats = map[string]bool{"png": true, "jpeg": true, "webp": true}
 var officeFormats = map[string]bool{"docx": true, "xlsx": true, "pptx": true}
+
+// odfFormats are ODF's own package family (odt/ods/odp), deliberately kept
+// separate from officeFormats: they go through the same convertOffice/
+// convertViaLibreOffice pipeline (LibreOffice's own native format, so the
+// same writer_pdf_Export/calc_pdf_Export/impress_pdf_Export filters
+// apply), but pdfMode's fidelity controls were verified specifically
+// against OOXML's filter registry entries, not ODF's, so pdfMode stays
+// inapplicable here—resolvePDFMode's applicability check is
+// officeFormats-only on purpose, and convertOffice is always called with
+// pdfMode="" for this family (see converter.run).
+var odfFormats = map[string]bool{"odt": true, "ods": true, "odp": true}
 
 func newConverter() *converter {
 	magick, _ := exec.LookPath("magick")
@@ -93,6 +107,9 @@ func (c *converter) supports(in, out string) bool {
 		return c.pdftoppm != ""
 	}
 	if officeFormats[in] && out == "pdf" {
+		return c.libreoffice != ""
+	}
+	if odfFormats[in] && out == "pdf" {
 		return c.libreoffice != ""
 	}
 	if (in == "markdown" || in == "html") && out == "pdf" {
@@ -182,6 +199,15 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 	}
 	if officeFormats[in] {
 		return c.convertOffice(ctx, in, pdfMode, inPath, outPath)
+	}
+	if odfFormats[in] && out == "pdf" {
+		// pdfMode never applies to ODF (see odfFormats's doc comment), so
+		// this always calls convertOffice with pdfMode="" regardless of
+		// what the caller passed—resolvePDFMode already refuses to resolve
+		// a non-blank pdfMode for this pair, so it can't be non-"" here in
+		// practice, but this makes that invariant explicit rather than
+		// relying on it silently.
+		return c.convertOffice(ctx, in, "", inPath, outPath)
 	}
 	if (in == "markdown" || in == "html") && out == "pdf" {
 		return c.convertMarkupToPDF(ctx, in, inPath, outPath)

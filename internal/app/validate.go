@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	_ "image/png"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -80,6 +82,13 @@ func validateUpload(path, original string) (string, error) {
 		if len(head) < 4 || !bytes.Equal(head[:4], []byte{'P', 'K', 0x03, 0x04}) {
 			return "", errors.New("extension and OOXML ZIP signature do not match")
 		}
+	case "odt", "ods", "odp":
+		if len(head) < 4 || !bytes.Equal(head[:4], []byte{'P', 'K', 0x03, 0x04}) {
+			return "", errors.New("extension and ODF ZIP signature do not match")
+		}
+		if !isODFMimetypeEntry(head, odfMimeType[candidate]) {
+			return "", errors.New("ODF mimetype entry is missing or does not match the declared format")
+		}
 	default:
 		if bytes.IndexByte(head, 0) >= 0 || !utf8.Valid(head) {
 			return "", errors.New("text input must be valid UTF-8 without NUL bytes")
@@ -131,6 +140,9 @@ func validateSyntax(format, path string) error {
 	if officeFormats[format] {
 		return validateOOXML(format, path)
 	}
+	if odfFormats[format] {
+		return validateODF(format, path)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -175,8 +187,11 @@ func validateSyntax(format, path string) error {
 }
 
 const (
-	maxOOXMLEntries          = 10000
-	maxOOXMLUncompressedSize = 200 << 20
+	// Shared ZIP-package safety bounds for both document package families
+	// this codebase accepts (OOXML: docx/xlsx/pptx, and ODF: odt/ods/odp)—
+	// see validateOOXML and validateODF, which apply them identically.
+	maxZIPPackageEntries          = 10000
+	maxZIPPackageUncompressedSize = 200 << 20
 	// Declared width*height ceiling for PNG/JPEG input, checked against the
 	// header BEFORE the full pixel buffer is ever allocated (image.Decode in
 	// convertImage decodes unconditionally otherwise). 100 megapixels covers
@@ -192,6 +207,46 @@ const (
 	// worst case to 300 rendered files zipped into one output.
 	maxPDFPages = 300
 )
+
+// odfMimeType is the exact, required value of an ODF package's mandatory
+// first "mimetype" entry for each ODF format this codebase accepts. Used
+// both by isODFMimetypeEntry (a raw byte-offset check against the
+// upload's header, mirroring the fixed-signature checks already done for
+// PNG/JPEG/OOXML) and by validateODF (re-checked against the actual ZIP
+// entry once the package is opened structurally).
+var odfMimeType = map[string]string{
+	"odt": "application/vnd.oasis.opendocument.text",
+	"ods": "application/vnd.oasis.opendocument.spreadsheet",
+	"odp": "application/vnd.oasis.opendocument.presentation",
+}
+
+// isODFMimetypeEntry checks that head—the file's first bytes—begins with
+// a ZIP local file header for an uncompressed "mimetype" entry (no extra
+// field) whose content is exactly want. The ODF package format requires
+// this exact layout: "mimetype" must be the package's first entry, stored
+// rather than deflated, with no extra field—which is precisely what lets
+// a content sniffer check a fixed byte offset directly, without opening
+// the file as a ZIP archive first, the same way this codebase already
+// checks a fixed PNG/JPEG signature. (Verified against the OASIS
+// OpenDocument Package specification's own mimetype-file requirements,
+// not guessed.)
+func isODFMimetypeEntry(head []byte, want string) bool {
+	const name = "mimetype"
+	if len(head) < 30+len(name) || want == "" {
+		return false
+	}
+	nameLen := int(binary.LittleEndian.Uint16(head[26:28]))
+	extraLen := int(binary.LittleEndian.Uint16(head[28:30]))
+	if nameLen != len(name) || extraLen != 0 {
+		return false
+	}
+	if string(head[30:30+len(name)]) != name {
+		return false
+	}
+	dataStart := 30 + len(name)
+	dataEnd := dataStart + len(want)
+	return len(head) >= dataEnd && string(head[dataStart:dataEnd]) == want
+}
 
 // dangerousHTMLTags are rejected outright regardless of attributes:
 // known active-content elements, plus <base>, which can redirect every
@@ -409,7 +464,7 @@ func validateOOXML(format, path string) error {
 		return errors.New("invalid OOXML ZIP structure")
 	}
 	defer zr.Close()
-	if len(zr.File) == 0 || len(zr.File) > maxOOXMLEntries {
+	if len(zr.File) == 0 || len(zr.File) > maxZIPPackageEntries {
 		return errors.New("OOXML package has an unsafe number of entries")
 	}
 	requiredRoot := map[string]string{"docx": "word/document.xml", "xlsx": "xl/workbook.xml", "pptx": "ppt/presentation.xml"}[format]
@@ -423,7 +478,7 @@ func validateOOXML(format, path string) error {
 		}
 		total += f.UncompressedSize64
 		zeroSizeMismatch := f.CompressedSize64 == 0 && f.UncompressedSize64 != 0
-		if total > maxOOXMLUncompressedSize || zeroSizeMismatch || (f.CompressedSize64 > 0 && f.UncompressedSize64/f.CompressedSize64 > 200) {
+		if total > maxZIPPackageUncompressedSize || zeroSizeMismatch || (f.CompressedSize64 > 0 && f.UncompressedSize64/f.CompressedSize64 > 200) {
 			return errors.New("OOXML package exceeds decompression safety limits")
 		}
 		lower := strings.ToLower(clean)
@@ -473,6 +528,194 @@ func validateOOXMLRelationships(f *zip.File) error {
 	}
 	return nil
 }
+
+// odfXLinkNS, odfTextNS, and odfDrawNS are the fixed namespace URIs ODF
+// uses for its xlink:href/text:a/draw:a elements (ODF 1.2/1.3 Part 1
+// schema). A document is free to bind any local prefix to these—only the
+// resolved namespace is meaningful, which is what encoding/xml gives us
+// via Name.Space rather than a literal prefix string match.
+const (
+	odfXLinkNS = "http://www.w3.org/1999/xlink"
+	odfTextNS  = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+	odfDrawNS  = "urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+)
+
+// odfObjectDirPattern matches an embedded object subpackage's directory,
+// e.g. "Object1/", ODF's convention for an embedded OLE/foreign-format
+// object (verified against real ODT/ODS files' own package layout, not
+// guessed)—the ODF counterpart to OOXML's "/embeddings/" path.
+var odfObjectDirPattern = regexp.MustCompile(`(?i)^object[0-9]+/`)
+
+// validateODF is validateOOXML's counterpart for the other ZIP-based
+// document package family this codebase accepts. It shares the same
+// package-safety bounds (entry count/size, zip-slip, decompression ratio)
+// and the same reject-outright stance on macros and embedded objects,
+// adapted to ODF's own layout: Basic/Python macros live under top-level
+// Basic/ or Scripts/ directories (verified against the OpenOffice/
+// LibreOffice Basic IDE's own documented library storage convention, not
+// guessed) rather than a vbaProject.bin part, and an embedded object is a
+// numbered ObjectN/ subpackage (odfObjectDirPattern) rather than an
+// /embeddings/ part.
+//
+// External resource references get the same default-deny treatment
+// validateHTMLForPDF settled on after temuan review P1, rather than
+// OOXML's narrower denylist-of-external-non-hyperlink-resources approach:
+// the ODF spec resolves a relative xlink:href "by the method of XML
+// Base" (ordinary RFC 3986 relative-reference resolution), and this
+// codebase found no unambiguous confirmation that every ODF-consuming
+// code path in LibreOffice resolves that purely against the package's
+// own entries rather than ever falling through to the filesystem the way
+// the HTML/Markdown->PDF path turned out to (temuan review P1 again)—so
+// rather than assume, every xlink:href outside a text:a/draw:a hyperlink
+// (never fetched, same allowance already made elsewhere in this
+// codebase) is accepted only when it has no URI scheme, no ".."
+// traversal segment, no leading "/", and actually names a real entry
+// already present in this same, already-validated ZIP package: exactly
+// the assets META-INF/manifest.xml itself already declares, never
+// anything resolved outside the package.
+func validateODF(format, path string) error {
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return errors.New("invalid ODF ZIP structure")
+	}
+	defer zr.Close()
+	if len(zr.File) == 0 || len(zr.File) > maxZIPPackageEntries {
+		return errors.New("ODF package has an unsafe number of entries")
+	}
+	entries := make(map[string]bool, len(zr.File))
+	var contentParts []*zip.File
+	foundMimetype, foundManifest, foundContent := false, false, false
+	var total uint64
+	for _, f := range zr.File {
+		name := strings.ReplaceAll(f.Name, "\\", "/")
+		clean := filepath.ToSlash(filepath.Clean(name))
+		if name == "" || strings.HasPrefix(name, "/") || filepath.VolumeName(clean) != "" || clean == ".." || strings.HasPrefix(clean, "../") {
+			return errors.New("ODF package contains an unsafe path")
+		}
+		entries[clean] = true
+		total += f.UncompressedSize64
+		zeroSizeMismatch := f.CompressedSize64 == 0 && f.UncompressedSize64 != 0
+		if total > maxZIPPackageUncompressedSize || zeroSizeMismatch || (f.CompressedSize64 > 0 && f.UncompressedSize64/f.CompressedSize64 > 200) {
+			return errors.New("ODF package exceeds decompression safety limits")
+		}
+		lower := strings.ToLower(clean)
+		if lower == "basic" || strings.HasPrefix(lower, "basic/") || lower == "scripts" || strings.HasPrefix(lower, "scripts/") || strings.HasSuffix(lower, ".xba") {
+			return errors.New("ODF macros are not accepted")
+		}
+		if odfObjectDirPattern.MatchString(clean) {
+			return errors.New("ODF embedded objects are not accepted")
+		}
+		switch clean {
+		case "mimetype":
+			foundMimetype = true
+			rc, err := f.Open()
+			if err != nil {
+				return errors.New("invalid ODF mimetype part")
+			}
+			declared, err := io.ReadAll(io.LimitReader(rc, 256))
+			_ = rc.Close()
+			if err != nil || string(declared) != odfMimeType[format] {
+				return errors.New("ODF mimetype does not match the declared format")
+			}
+		case "META-INF/manifest.xml":
+			foundManifest = true
+		case "content.xml":
+			foundContent = true
+			contentParts = append(contentParts, f)
+		case "styles.xml":
+			contentParts = append(contentParts, f)
+		}
+	}
+	if !foundMimetype || !foundManifest || !foundContent {
+		return errors.New("ODF package is missing required document parts")
+	}
+	for _, f := range contentParts {
+		if err := validateODFResourceReferences(f, entries); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateODFResourceReferences scans f (content.xml or styles.xml) for
+// every xlink:href attribute, on any element, and rejects it per
+// validateODFResourceHref unless the enclosing element is a text:a or
+// draw:a hyperlink. Uses a streaming xml.Decoder rather than pattern-
+// matching the raw bytes for the same reason validateHTMLForPDF does:
+// encoding/xml decodes character references in attribute values the same
+// way a real XML consumer (LibreOffice's included) would, so a check
+// against attr.Value here can't be bypassed by an encoded scheme the way
+// a raw-byte regex could (temuan review P1).
+func validateODFResourceReferences(f *zip.File, packageEntries map[string]bool) error {
+	if f.UncompressedSize64 > maxZIPPackageUncompressedSize {
+		return errors.New("ODF document part is too large")
+	}
+	r, err := f.Open()
+	if err != nil {
+		return errors.New("invalid ODF document part")
+	}
+	defer r.Close()
+	dec := xml.NewDecoder(io.LimitReader(r, maxZIPPackageUncompressedSize))
+	hyperlinkDepth := 0
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return errors.New("invalid ODF document part XML")
+		}
+		switch el := tok.(type) {
+		case xml.StartElement:
+			isHyperlink := (el.Name.Space == odfTextNS || el.Name.Space == odfDrawNS) && el.Name.Local == "a"
+			if isHyperlink {
+				hyperlinkDepth++
+			}
+			if hyperlinkDepth > 0 {
+				continue
+			}
+			for _, attr := range el.Attr {
+				if attr.Name.Space != odfXLinkNS || attr.Name.Local != "href" {
+					continue
+				}
+				if err := validateODFResourceHref(attr.Value, packageEntries); err != nil {
+					return err
+				}
+			}
+		case xml.EndElement:
+			if hyperlinkDepth > 0 && (el.Name.Space == odfTextNS || el.Name.Space == odfDrawNS) && el.Name.Local == "a" {
+				hyperlinkDepth--
+			}
+		}
+	}
+	return nil
+}
+
+// validateODFResourceHref accepts href only when it's empty, an in-
+// document fragment ("#..."), or a package-relative path with no URI
+// scheme/host, no ".." traversal segment, and no leading "/"—and which
+// actually names a real entry already present in packageEntries. See
+// validateODF's doc comment for why this is a default-deny allowlist
+// against the package's own real contents rather than a denylist of
+// external URL schemes.
+func validateODFResourceHref(href string, packageEntries map[string]bool) error {
+	if href == "" || strings.HasPrefix(href, "#") {
+		return nil
+	}
+	u, err := url.Parse(href)
+	if err != nil || u.IsAbs() || u.Host != "" || u.Scheme != "" {
+		return errors.New("ODF external resource references are not accepted")
+	}
+	clean := filepath.ToSlash(filepath.Clean(href))
+	if strings.HasPrefix(href, "/") || clean == ".." || strings.HasPrefix(clean, "../") {
+		return errors.New("ODF resource references outside the package are not accepted")
+	}
+	if !packageEntries[clean] {
+		return errors.New("ODF resource reference does not match a real package entry")
+	}
+	return nil
+}
+
 func looksExecutable(b []byte) bool {
 	return bytes.HasPrefix(b, []byte("MZ")) || bytes.HasPrefix(b, []byte{0x7f, 'E', 'L', 'F'}) || bytes.HasPrefix(b, []byte("#!")) || bytes.HasPrefix(b, []byte{0xca, 0xfe, 0xba, 0xbe})
 }
@@ -493,6 +736,14 @@ func mimeAllowed(format, mime string) bool {
 	if officeFormats[format] {
 		return mime == "application/zip" || mime == "application/octet-stream" ||
 			strings.HasPrefix(mime, "application/vnd.openxmlformats-officedocument.")
+	}
+	if odfFormats[format] {
+		// http.DetectContentType has no ODF-specific sniffing of its own—it
+		// only recognizes the generic ZIP signature every ODF package also
+		// has—so it reports "application/zip", never the exact ODF media
+		// type isODFMimetypeEntry already checked directly against the
+		// package's own mandatory mimetype entry.
+		return mime == "application/zip" || mime == "application/octet-stream" || mime == odfMimeType[format]
 	}
 	return strings.HasPrefix(mime, "text/") || mime == "application/json" || mime == "application/xml" || mime == "application/octet-stream"
 }
