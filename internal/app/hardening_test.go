@@ -247,13 +247,13 @@ func TestPDFToImageJobFlowsThroughWorkerReload(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("status endpoint returned %d for a live job", code)
 		}
-		if job.Status != Queued {
+		if job.Status == Completed || job.Status == Failed {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if job.Status == Queued {
-		t.Fatal("job never left Queued—worker reload() silently dropped it (the P1 regression)")
+	if job.Status == Queued || job.Status == Processing {
+		t.Fatalf("job never reached a terminal status—worker reload() silently dropped it (the P1 regression), stuck at %s", job.Status)
 	}
 	if job.Status != Failed {
 		t.Fatalf("expected Failed (pdftoppm is a fake path), got %s", job.Status)

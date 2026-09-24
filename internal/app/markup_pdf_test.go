@@ -239,13 +239,13 @@ func TestMarkdownAndHTMLToPDFJobsFlowThroughWorker(t *testing.T) {
 					t.Fatalf("status endpoint returned %d for a live job", rec.Code)
 				}
 				_ = json.Unmarshal(rec.Body.Bytes(), &job)
-				if job.Status != Queued {
+				if job.Status == Completed || job.Status == Failed {
 					break
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			if job.Status == Queued {
-				t.Fatal("job never left Queued")
+			if job.Status == Queued || job.Status == Processing {
+				t.Fatalf("job never reached a terminal status, stuck at %s", job.Status)
 			}
 			if job.Status != Failed {
 				t.Fatalf("expected Failed (libreoffice is a fake path), got %s", job.Status)

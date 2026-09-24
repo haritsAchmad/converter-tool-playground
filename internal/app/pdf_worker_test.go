@@ -106,13 +106,13 @@ func TestPDFJobsProcessedByIsolatedPDFQueueWorker(t *testing.T) {
 			t.Fatalf("status endpoint returned %d for a live job", rec.Code)
 		}
 		_ = json.Unmarshal(rec.Body.Bytes(), &job)
-		if job.Status != Queued {
+		if job.Status == Completed || job.Status == Failed {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if job.Status == Queued {
-		t.Fatal("PDF job never left Queued -- it isn't being drained by the isolated PDF worker")
+	if job.Status == Queued || job.Status == Processing {
+		t.Fatalf("PDF job never reached a terminal status -- it isn't being drained by the isolated PDF worker, stuck at %s", job.Status)
 	}
 	if job.Status != Failed {
 		t.Fatalf("expected Failed (pdftoppm is a fake path), got %s", job.Status)
