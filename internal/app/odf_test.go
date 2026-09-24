@@ -2,6 +2,7 @@ package app
 
 import (
 	"archive/zip"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,17 @@ import (
 // "build a real fixture, not a placeholder" approach), a manifest, and an
 // empty content.xml. extra lets a test add or override specific parts to
 // probe validateODF's rejection paths, mirroring writeOOXMLFixture.
+//
+// The mimetype entry is written via zw.CreateRaw with a precomputed
+// CRC32/size rather than the more obvious zw.CreateHeader+Write—see
+// writeMinimalODF (odf_pdf_test.go) for why: CreateHeader's streaming
+// Write() defers the entry's CRC32/size into a trailing data descriptor
+// since it doesn't know the final size up front, which produces a
+// technically-invalid "first entry" by the OASIS package spec's own
+// requirement (immediately readable, no descriptor, no extra field)—Go's
+// own archive/zip.Reader tolerates it fine (it always trusts the central
+// directory), which is exactly why this went unnoticed here until a real
+// LibreOffice rejected an ODF built the older way outright.
 func writeODFFixture(t *testing.T, format string, extra map[string]string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "input.bin")
@@ -23,11 +35,18 @@ func writeODFFixture(t *testing.T, format string, extra map[string]string) strin
 		t.Fatal(err)
 	}
 	zw := zip.NewWriter(f)
-	mw, err := zw.CreateHeader(&zip.FileHeader{Name: "mimetype", Method: zip.Store})
+	mimeBytes := []byte(odfMimeType[format])
+	mw, err := zw.CreateRaw(&zip.FileHeader{
+		Name:               "mimetype",
+		Method:             zip.Store,
+		CRC32:              crc32.ChecksumIEEE(mimeBytes),
+		CompressedSize64:   uint64(len(mimeBytes)),
+		UncompressedSize64: uint64(len(mimeBytes)),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mw.Write([]byte(odfMimeType[format])); err != nil {
+	if _, err := mw.Write(mimeBytes); err != nil {
 		t.Fatal(err)
 	}
 	parts := map[string]string{
