@@ -77,6 +77,11 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		queue: queue, pdfQueue: pdfQueue, limiter: newRateLimiter(cfg.RateRPS, cfg.RateBurst),
 		metrics: m, registry: registry, scanner: scanner, ctx: ctx, cancel: cancel,
 	}
+	// A Config built by hand (tests) leaves OCRLanguages empty; the
+	// converter then keeps the default newConverter already resolved.
+	if cfg.OCRLanguages != "" {
+		a.converter.configureOCR(cfg.OCRLanguages)
+	}
 	s.recover(time.Now().UTC(), logger, cfg.Mode == "standalone", cfg.Mode == "standalone")
 	switch cfg.Mode {
 	case "standalone", "worker":
@@ -143,7 +148,10 @@ func (a *App) Handler() http.Handler {
 func (a *App) getFormats(w http.ResponseWriter, r *http.Request) {
 	list := a.converter.capabilities()
 	sort.Slice(list, func(i, j int) bool { return list[i].ID < list[j].ID })
-	writeJSON(w, http.StatusOK, map[string]any{"formats": list, "maxUploadBytes": a.cfg.MaxUploadBytes, "jobTTLSeconds": int(a.cfg.JobTTL.Seconds())})
+	// pdfOCR tells a client whether a scanned (image-only) PDF can be
+	// converted to DOCX here: the pair itself is always listed, since a
+	// PDF with a text layer needs no OCR.
+	writeJSON(w, http.StatusOK, map[string]any{"formats": list, "maxUploadBytes": a.cfg.MaxUploadBytes, "jobTTLSeconds": int(a.cfg.JobTTL.Seconds()), "pdfOCR": a.converter.ocrAvailable()})
 }
 
 func (a *App) createJob(w http.ResponseWriter, r *http.Request) {
