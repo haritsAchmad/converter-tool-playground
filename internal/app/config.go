@@ -20,6 +20,10 @@ type Config struct {
 	RateRPS, RateBurst                                 float64
 	MaxJobsPerIP                                       int
 	MaxJobAttempts                                     int
+	// OCRLanguages is CONVERTBOX_OCR_LANGUAGES: the Tesseract languages
+	// PDF -> DOCX's OCR fallback uses, "+"-joined in priority order. See
+	// ocr.go.
+	OCRLanguages string
 }
 
 func LoadConfig() (Config, error) {
@@ -43,6 +47,7 @@ func LoadConfig() (Config, error) {
 		RateBurst:       envFloat("CONVERTBOX_RATE_BURST", 5),
 		MaxJobsPerIP:    envInt("CONVERTBOX_MAX_JOBS_PER_IP", 4),
 		MaxJobAttempts:  envInt("CONVERTBOX_MAX_JOB_ATTEMPTS", 3),
+		OCRLanguages:    env("CONVERTBOX_OCR_LANGUAGES", defaultOCRLanguages),
 	}
 	if c.Workers < 1 || c.QueueSize < 1 || c.MaxUploadBytes < 1 || c.JobTTL < time.Minute {
 		return c, fmt.Errorf("workers, queue, size must be positive and TTL at least 1m")
@@ -55,6 +60,9 @@ func LoadConfig() (Config, error) {
 	}
 	if c.Mode != "standalone" && c.Mode != "api" && c.Mode != "worker" && c.Mode != "pdf-worker" {
 		return c, fmt.Errorf("mode must be standalone, api, worker, or pdf-worker")
+	}
+	if _, err := parseOCRLanguages(c.OCRLanguages); err != nil {
+		return c, fmt.Errorf("CONVERTBOX_OCR_LANGUAGES: %w", err)
 	}
 	if c.Mode != "standalone" && c.RedisURL == "" {
 		return c, fmt.Errorf("redis URL is required in api and worker modes")

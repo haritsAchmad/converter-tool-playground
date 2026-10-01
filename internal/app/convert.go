@@ -36,7 +36,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type converter struct{ magick, pdftoppm, libreoffice, ffmpeg, ffprobe string }
+type converter struct {
+	magick, pdftoppm, libreoffice, ffmpeg, ffprobe string
+	// tesseract and ocrLangs are PDF -> DOCX's OCR fallback (see ocr.go):
+	// the Tesseract executable, and the "+"-joined subset of the
+	// configured languages it actually has installed. ocrLangs is empty
+	// whenever OCR can't run.
+	tesseract, ocrLangs string
+	// ocrOverride replaces the real pdftoppm+Tesseract page OCR in tests.
+	ocrOverride pageOCR
+}
 
 var formats = map[string]Format{
 	"csv":      {"csv", "CSV", "Data", []string{".csv"}},
@@ -157,7 +166,13 @@ func newConverter() *converter {
 	}
 	ffmpeg, _ := exec.LookPath("ffmpeg")
 	ffprobe, _ := exec.LookPath("ffprobe")
-	return &converter{magick: magick, pdftoppm: pdftoppm, libreoffice: libreoffice, ffmpeg: ffmpeg, ffprobe: ffprobe}
+	tesseract, _ := exec.LookPath("tesseract")
+	c := &converter{magick: magick, pdftoppm: pdftoppm, libreoffice: libreoffice, ffmpeg: ffmpeg, ffprobe: ffprobe, tesseract: tesseract}
+	// New() calls configureOCR again with CONVERTBOX_OCR_LANGUAGES; the
+	// default here keeps a converter built directly (tests) consistent
+	// with an unconfigured server.
+	c.configureOCR(defaultOCRLanguages)
+	return c
 }
 
 func (c *converter) capabilities() []publicFormat {
@@ -290,7 +305,7 @@ func (c *converter) run(ctx context.Context, in, out, pdfMode, inPath, outPath s
 		return convertData(in, out, inPath, outPath)
 	}
 	if in == "pdf" && pdfTextExtractionFormats[out] {
-		return convertPDFToDocx(ctx, inPath, outPath)
+		return c.convertPDFToDocx(ctx, inPath, outPath)
 	}
 	if in == "pdf" {
 		return c.convertPDF(ctx, out, inPath, outPath)
@@ -743,12 +758,14 @@ const maxPDFExtractedTextBytes = 20 << 20
 // comment describes: plain text only, one DOCX paragraph per extracted
 // line, a page break between each source PDF page, nothing else. A
 // page ledongthuc/pdf can't extract text from (an unusual font
-// encoding, or a scanned/image-only page with no text layer at all)
-// contributes an empty page rather than failing the whole job—but if
-// literally nothing came back non-blank across every page, the job
-// fails outright with a clear reason instead of silently producing a
-// DOCX with nothing useful in it.
-func convertPDFToDocx(ctx context.Context, inPath, outPath string) (err error) {
+// encoding, or a scanned/image-only page with no text layer at all) is
+// handed to OCR when OCR is available (see ocr.go)—and only such a page:
+// one that already yielded text is never rendered or OCR'd. A page
+// neither path gets text from contributes an empty page rather than
+// failing the whole job—but if literally nothing came back non-blank
+// across every page, the job fails outright with a clear reason instead
+// of silently producing a DOCX with nothing useful in it.
+func (c *converter) convertPDFToDocx(ctx context.Context, inPath, outPath string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("PDF text extraction panicked: %v", r)
@@ -772,25 +789,70 @@ func convertPDFToDocx(ctx context.Context, inPath, outPath string) (err error) {
 	pages := make([]string, numPages)
 	total := 0
 	nonBlank := false
+	// textless collects the pages extraction got nothing from, in page
+	// order: the only candidates for OCR.
+	var textless []int
 	for i := 1; i <= numPages; i++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		text, extractErr := r.Page(i).GetPlainText(nil)
-		if extractErr != nil {
-			continue // best-effort: leave this one page blank, don't fail the job
+		if extractErr != nil || strings.TrimSpace(text) == "" {
+			// best-effort: a page that failed to extract is treated like a
+			// page with no text layer, not as a reason to fail the job.
+			textless = append(textless, i)
+			continue
 		}
 		total += len(text)
 		if total > maxPDFExtractedTextBytes {
 			return errors.New("extracted text exceeds the safety limit")
 		}
-		if strings.TrimSpace(text) != "" {
-			nonBlank = true
-		}
+		nonBlank = true
 		pages[i-1] = text
 	}
+
+	ocr := c.pageOCR()
+	var ocrErr error
+	if ocr != nil && len(textless) > 0 {
+		if !nonBlank && len(textless) > maxOCRPages {
+			// A fully scanned document longer than the cap: OCR'ing just
+			// its first maxOCRPages pages would hand back a DOCX that
+			// silently stops partway through, which is worse than a clear
+			// refusal. A mostly-text PDF over the cap (below) is different
+			// —its text pages are all there, and what's skipped is at
+			// worst some of its figure-only or blank pages.
+			return errOCRPageLimit(len(textless))
+		}
+		if len(textless) > maxOCRPages {
+			textless = textless[:maxOCRPages]
+		}
+		for _, page := range textless {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			text, pageErr := ocr(ctx, inPath, page)
+			if pageErr != nil {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				// Same best-effort rule as extraction: one unreadable
+				// page stays blank. The error is kept so that, if nothing
+				// at all comes back, the job's failure says why.
+				ocrErr = pageErr
+				continue
+			}
+			total += len(text)
+			if total > maxPDFExtractedTextBytes {
+				return errors.New("extracted text exceeds the safety limit")
+			}
+			if strings.TrimSpace(text) != "" {
+				nonBlank = true
+				pages[page-1] = text
+			}
+		}
+	}
 	if !nonBlank {
-		return errors.New("no extractable text found in this PDF (image-only pages or an unsupported font encoding)")
+		return errNoPDFText(ocr != nil, ocrErr)
 	}
 	// A per-page check runs at the TOP of each loop iteration above, so
 	// cancellation arriving during or right after the LAST page's own

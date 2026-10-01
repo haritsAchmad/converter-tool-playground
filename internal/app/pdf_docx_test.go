@@ -198,7 +198,7 @@ func TestPDFToDocxRequiredPartsExist(t *testing.T) {
 		t.Fatal(err)
 	}
 	outPath := filepath.Join(dir, "out.docx")
-	if err := convertPDFToDocx(context.Background(), inPath, outPath); err != nil {
+	if err := (&converter{}).convertPDFToDocx(context.Background(), inPath, outPath); err != nil {
 		t.Fatalf("convertPDFToDocx failed: %v", err)
 	}
 	names := zipEntryNames(t, outPath)
@@ -228,7 +228,7 @@ func TestPDFToDocxExtractsRealTextInOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	outPath := filepath.Join(dir, "out.docx")
-	if err := convertPDFToDocx(context.Background(), inPath, outPath); err != nil {
+	if err := (&converter{}).convertPDFToDocx(context.Background(), inPath, outPath); err != nil {
 		t.Fatalf("convertPDFToDocx failed: %v", err)
 	}
 	tokens := parseDocx(t, outPath)
@@ -266,7 +266,7 @@ func TestPDFToDocxRejectsWhenNoTextFound(t *testing.T) {
 		t.Fatal(err)
 	}
 	outPath := filepath.Join(dir, "out.docx")
-	err := convertPDFToDocx(context.Background(), inPath, outPath)
+	err := (&converter{}).convertPDFToDocx(context.Background(), inPath, outPath)
 	if err == nil {
 		t.Fatal("expected a PDF with no extractable text to be rejected")
 	}
@@ -426,7 +426,7 @@ func TestConvertPDFToDocxChecksContextAfterLastPage(t *testing.T) {
 	}
 	ctx := &countingCancelContext{Context: context.Background(), n: 1}
 	outPath := filepath.Join(dir, "out.docx")
-	err := convertPDFToDocx(ctx, inPath, outPath)
+	err := (&converter{}).convertPDFToDocx(ctx, inPath, outPath)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled from the post-loop check, got %v", err)
 	}

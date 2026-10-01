@@ -25,12 +25,15 @@ jobs:
       # specifically looks for, and there's no simple, low-maintenance
       # apt source for IM7 on this runner—WebP conversion tests still
       # self-skip here, same as before this step).
-      - name: Install LibreOffice/ffmpeg/poppler for real-tool tests
+      # tesseract-ocr (+ its eng/ind models) is here for the same reason:
+      # PDF->DOCX's OCR fallback tests self-skip without it and pdftoppm.
+      - name: Install LibreOffice/ffmpeg/poppler/Tesseract for real-tool tests
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             libreoffice-writer libreoffice-calc libreoffice-impress \
             ffmpeg poppler-utils \
+            tesseract-ocr tesseract-ocr-eng tesseract-ocr-ind \
             fonts-liberation fonts-dejavu fonts-noto-core
       - run: go test -race ./...
       - run: go vet ./...
