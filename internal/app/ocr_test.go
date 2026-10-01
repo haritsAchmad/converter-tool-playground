@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -370,7 +372,16 @@ func TestRealOCRIsKilledByAnExpiredDeadline(t *testing.T) {
 // TestPDFToDocxJobFlowsThroughWorker.
 func TestScannedPDFJobFlowsThroughWorker(t *testing.T) {
 	c := requireOCRTools(t)
-	a := testApp(t)
+	// Not testApp: its 1s JobTimeout is sized for pure-Go conversions. One
+	// OCR page is a pdftoppm render plus a Tesseract run, which took longer
+	// than that on a CI runner under -race and failed this test with the
+	// job's deadline, not with anything OCR did wrong.
+	cfg := Config{Address: ":0", StorageRoot: t.TempDir(), MaxUploadBytes: 1 << 20, Workers: 1, QueueSize: 2, JobTimeout: 60 * time.Second, JobTTL: time.Minute, CleanupInterval: time.Hour, UploadTimeout: time.Second, RateRPS: 100, RateBurst: 100, MaxJobsPerIP: 100}
+	a, err := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Close)
 	if !a.converter.ocrAvailable() {
 		t.Skip("the app's own converter has no OCR languages installed")
 	}
@@ -382,7 +393,7 @@ func TestScannedPDFJobFlowsThroughWorker(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(40 * time.Second)
+	deadline := time.Now().Add(90 * time.Second)
 	var job Job
 	for time.Now().Before(deadline) {
 		rec := httptest.NewRecorder()
