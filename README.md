@@ -204,4 +204,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md) before sub
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Library, program, model, data, dan aset pihak lain beserta lisensinya dicatat di [CREDITS.md](CREDITS.md).
