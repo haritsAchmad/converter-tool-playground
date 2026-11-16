@@ -19,6 +19,23 @@ Small, self-hosted file conversion service with deliberately short-lived storage
 
 The API returns capabilities at runtime, so unavailable engines are not advertised. PDF → DOCX is experimental plain-text extraction only (see the table row above); legacy Office formats and macro-enabled documents are intentionally not enabled; see [ROADMAP.md](ROADMAP.md).
 
+## System requirements
+
+Measured on 16 November 2026 on the developer laptop: Windows 11 Home 64-bit, AMD Ryzen 5 7535HS (6 cores, 12 threads), 16 GB RAM, Docker 29.9.3. "Minimum" is derived from those numbers and the Compose limits; it has not been tried on a weaker machine.
+
+| | Minimum | Recommended | Measured on the test laptop |
+| --- | --- | --- | --- |
+| Operating system | Any 64-bit OS that runs Docker; local `go run` on Windows, Linux, or macOS | Linux host for public deployments (see [Deploying beyond localhost](#deploying-beyond-localhost)) | Windows 11 Home 64-bit |
+| CPU | 2 cores | 4 cores (Compose caps API, worker, and PDF worker at 1 core each) | Ryzen 5 7535HS 6c/12t |
+| RAM | Local `go run` without engines: 64 MB (idle 19 MB working set, 20 MB after a CSV→JSON job). Compose: 2 GB free (container limits add up to 1.7 GB: API 256 MB, worker 768 MB, PDF worker 384 MB, Redis 128 MB, proxy 128 MB) | 4 GB+ when LibreOffice/ffmpeg jobs run in parallel | see Minimum |
+| GPU | Not used | -- | -- |
+| Free disk | Local: 40 MB binary + job storage (25 MB per upload by default, kept 20 min). Compose: ~1.8 GB for the image | + room for job outputs | image 1.72 GB, binary 38 MB |
+| Screen | Any modern browser | -- | -- |
+| Internet | Once, to pull images or Go modules; conversions run offline | -- | -- |
+| Build | Go 1.25+ (`go.mod`), or Docker with Compose | -- | go1.26.1 |
+
+Optional engines for a local run (the Docker image already includes them; each one only unlocks its formats): ImageMagick 7 (WebP), poppler-utils (PDF → image), LibreOffice (Office/Markdown/HTML → PDF), ffmpeg + ffprobe (audio/video), Tesseract (OCR for scanned PDFs), ClamAV `clamscan` (upload scanning).
+
 ## Quick start
 
 With Docker (recommended):
